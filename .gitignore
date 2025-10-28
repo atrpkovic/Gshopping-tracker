@@ -1,0 +1,13 @@
+# Python cache and venv
+__pycache__/
+*.pyc
+venv/
+.env
+
+# Streamlit and config files
+.streamlit/
+.secrets.toml
+
+# OS files
+.DS_Store
+Thumbs.db
