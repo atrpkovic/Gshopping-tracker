@@ -6,18 +6,10 @@ import streamlit as st
 import plotly.express as px
 from datetime import datetime
 
-# ----------------------------
-# Secrets / environment
-# ----------------------------
-# On Streamlit Cloud, set SERPAPI_KEY in "App → Settings → Secrets"
 SERPAPI_KEY = st.secrets.get("SERPAPI_KEY") or os.getenv("SERPAPI_KEY")
 if SERPAPI_KEY:
     os.environ["SERPAPI_KEY"] = SERPAPI_KEY  # ensure backend sees it
 
-# ----------------------------
-# Import your backend module
-# (safe: it only runs main() when __name__ == '__main__')
-# ----------------------------
 import gshop_tracker as tracker  # this is your gshop-tracker.py (rename file if needed)
 
 # File names expected by the backend:
@@ -57,9 +49,6 @@ st.sidebar.caption(
     "• Keywords CSV: a column `keyword` / `keywords` (or single column) — TXT: one per line"
 )
 
-# ----------------------------
-# Helpers to persist uploads to the filenames the backend expects
-# ----------------------------
 def persist_brands(file) -> bool:
     """Write brands to brands.json as {domain: [aliases...]}"""
     if not file:
@@ -130,16 +119,10 @@ def persist_keywords(file) -> bool:
         return False
 
 
-# ----------------------------
-# Run button
-# ----------------------------
 run_col, _ = st.columns([1, 3])
 with run_col:
     clicked = st.button("▶️ Run Tracker", type="primary", use_container_width=True)
 
-# ----------------------------
-# Execute backend + visualize
-# ----------------------------
 if clicked:
     # Pre-checks
     if not SERPAPI_KEY:
@@ -231,9 +214,6 @@ if clicked:
     cols_keep = [c for c in ["Timestamp","Keyword","Location","Brand Domain","Product Title","Position"] if c in df.columns]
     st.dataframe(df.sort_values("Position").head(10)[cols_keep], hide_index=True)
 
-# ----------------------------
-# Footer help
-# ----------------------------
 with st.expander("Notes / Troubleshooting"):
     st.markdown(
         "- This app writes your uploads to the filenames your backend expects "
