@@ -11,3 +11,4 @@ venv/
 # OS files
 .DS_Store
 Thumbs.db
+google_shopping_brand_hits.csv
