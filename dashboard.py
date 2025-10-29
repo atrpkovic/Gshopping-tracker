@@ -94,15 +94,17 @@ def persist_brands(file) -> bool:
     except Exception:
         return False
 
+def _strip_bom(s: str) -> str:
+    return s.lstrip("\ufeff").strip()
+
 def persist_keywords(file) -> bool:
-    """Write keywords to keywords.csv (one per line)"""
     if not file:
         return False
     name = (file.name or "").lower()
     try:
         if name.endswith(".csv"):
             file.seek(0)
-            df = pd.read_csv(file)
+            df = pd.read_csv(file, encoding="utf-8-sig")  # <- handles BOM
             cols = [c.strip().lower() for c in df.columns]
             df.columns = cols
             if "keyword" in cols:
@@ -112,21 +114,21 @@ def persist_keywords(file) -> bool:
             else:
                 first = df.columns[0]
                 vals = df[first].dropna().astype(str)
-            kw = [v.strip() for v in vals if v and str(v).strip()]
+            kw = [_strip_bom(v) for v in vals if _strip_bom(str(v))]
         else:
-            # TXT or anything else: one per line
             file.seek(0)
             txt = file.read()
             if isinstance(txt, bytes):
                 txt = txt.decode("utf-8", errors="ignore")
-            kw = [line.strip() for line in txt.splitlines() if line.strip()]
-        # write CSV (one keyword per line)
+            kw = [_strip_bom(line) for line in txt.splitlines() if _strip_bom(line)]
+
         with open(KEYWORDS_FILE, "w", encoding="utf-8-sig", newline="") as f:
             for k in kw:
                 f.write(f"{k}\n")
         return True
     except Exception:
         return False
+
 
 # ----------------------------
 # Run button

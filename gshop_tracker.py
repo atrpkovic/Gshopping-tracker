@@ -38,8 +38,8 @@ CURRENCY = "USD"
 
 # Multi-location tracking
 MULTI_LOCATIONS = [
-    {"name": "Coppell, Texas, United States", "code": 9061237},
-    {"name": "Dallas, Texas, United States", "code": 1023191},
+    #{"name": "Coppell, Texas, United States", "code": 9061237},
+    #{"name": "Dallas, Texas, United States", "code": 1023191},
     {"name": "Miami, Florida, United States", "code": 1021999},
     {"name": "Los Angeles, California, United States", "code": 1014221},
     {"name": "New York, New York, United States", "code": 1023768}
