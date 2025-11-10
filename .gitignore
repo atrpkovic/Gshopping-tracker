@@ -3,7 +3,9 @@ __pycache__/
 *.pyc
 venv/
 .env
-
+*.env
+.csv
+*.csv
 # Streamlit and config files
 .streamlit/
 .secrets.toml
