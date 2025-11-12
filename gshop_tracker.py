@@ -1,561 +1,524 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-Google Shopping Brand Position + Price/Discount Tracker
-------------------------------------------------------
-- Tracks brand placements for Google Shopping by keyword
-- Captures price, old price, and discount %
-- Runs across multiple locations (6 states + 12 metros)
+Google Shopping brand-hit tracker (multi-sheet in/out, multi-location).
+- Loads SERPAPI_KEY from env (or .env if python-dotenv is installed)
+- Reads keywords from Excel/CSV. If Excel with multiple sheets: each sheet is processed separately.
+- Queries SerpAPI "google_shopping" for each keyword × each location
+- Matches results by brand synonyms against a brand map:
+    * Built-in DEFAULT_BRANDS_MAP (dict in code; previous behavior restored)
+    * Optional external JSON override (same shape), if BRANDS_JSON_PATH points to a file
+- Writes one output XLSX: one sheet per input sheet, keeping sheet names.
+- If output XLSX is locked (WinError 32), falls back to CSV files (one per sheet).
 
-Requirements:
-  pip install python-dotenv requests
+Notes
+- You’ll need a SerpAPI key (env var SERPAPI_KEY).
+- Locations are Google Shopping uule/cid engine parameters handled via SerpAPI’s "location" parameter.
+- This script is intentionally verbose & defensive, to avoid silent failures.
 
-Environment:
-  SERPAPI_KEY=<your_api_key>  # in .env (same folder) or OS env
-
-Inputs:
-  keywords.csv      -> one keyword per line
-  brands.json       -> {"branddomain.com": ["Brand Name", "Brand Alias", ...], ...}
-
-Output:
-  google_shopping_brand_hits.csv
-
-Notes:
-  - Uses SerpApi's google_shopping engine
-  - Prefers SerpApi location_code (resolved automatically); falls back to location name
+Author: (Your name)
 """
 
-import json
+from __future__ import annotations
+
 import os
-from dotenv import load_dotenv
-import requests
-import csv
-from datetime import datetime, timezone
-import time
-import random
-from urllib.parse import urlparse, parse_qs
-from typing import Optional, List, Dict, Tuple
-import logging
 import re
+import io
+import sys
+import json
+import time
+import math
+import copy
+import csv
+import uuid
+import atexit
+import random
+import logging
+import pathlib
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
-# -------------------- Logging --------------------
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# --- Optional .env loader (safe if not installed) ---
+try:
+    from pathlib import Path
+    from dotenv import load_dotenv  # type: ignore
+    # 1) load .env next to this file; 2) also load from CWD as fallback
+    load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
+    load_dotenv()
+except Exception:
+    pass
 
-# -------------------- Config --------------------
-load_dotenv()
+import requests
+import pandas as pd
+
+# ----------------------------
+# Configuration (edit as needed)
+# ----------------------------
+
+# Path to your keywords file:
+# - If Excel: multi-sheet supported. Every sheet must have a column named "keyword".
+# - If CSV: single sheet; the sheet name will be "Sheet1" for output.
+KEYWORDS_FILE = os.environ.get("KEYWORDS_FILE", "keywords_test.xlsx")  # you can set to "keywords_test.xlsx" while testing
+
+# Optional explicit list of sheets to use (comma-separated), e.g. "sizes,brands"
+# If not set, process all sheets (Excel) or the single CSV.
+SHEETS = [s.strip() for s in os.environ.get("KEYWORDS_SHEETS", "").split(",") if s.strip()]
+
+# Output file name (XLSX)
+OUTPUT_XLSX = os.environ.get("OUTPUT_XLSX", "google_shopping_brand_hits.xlsx")
+
+# Optional CSV fallback directory (used if XLSX is locked)
+CSV_FALLBACK_DIR = os.environ.get("CSV_FALLBACK_DIR", "brand_hits_csv")
+
+# SerpAPI key must be present
 SERPAPI_KEY = os.getenv("SERPAPI_KEY")
 
-KEYWORDS_FILE = "keywords.csv"          # one keyword per line
-BRANDS_FILE   = "brands.json"           # {"domain.com": ["Brand", "Alias1", "Alias2"]}
-OUTPUT_FILE   = "google_shopping_brand_hits.csv"
+# Engine config
+SERP_ENGINE = "google_shopping"
+GOOGLE_DOMAIN = os.environ.get("GOOGLE_DOMAIN", "google.com")
+GL = os.environ.get("GL", "us")      # country
+HL = os.environ.get("HL", "en")      # language
 
-SAVE_JSON = False   # set True to save raw SerpApi responses for debugging
+# Delay between calls to be polite (seconds)
+SLEEP_BETWEEN_CALLS = float(os.environ.get("SLEEP_BETWEEN_CALLS", "1.0"))
 
-# Rate limiting between keyword queries
-MIN_DELAY = 2.0
-MAX_DELAY = 5.0
+# Per-keyword maximum shopping results pulled (SerpAPI supports "num" up to ~100)
+MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "50"))
 
-# Optional single-location fallback (used only if MULTI_LOCATIONS is empty)
-LOCATION      = None        # e.g., "Miami, Florida, United States"
-LOCATION_CODE = None        # e.g., 1021999
+# Optional external brands JSON override path. If provided & valid, will override the default dict below.
+BRANDS_JSON_PATH = os.environ.get("BRANDS_JSON_PATH", "").strip() or None
 
-COUNTRY  = "us"   # gl
-CURRENCY = "USD"
+# Restore in-code dict loading: minimal, you can expand it. External JSON still can override this.
+DEFAULT_BRANDS_MAP: Dict[str, List[str]] = {
+    "prioritytire.com": ["priority tire", "prioritytire"],
+    "simpletire.com":   ["simple tire", "simpletire"],
+    # Feel free to add more here if desired (fallback only)
+    # "tirerack.com": ["tire rack", "tirerack"],
+    # "discounttire.com": ["discount tire", "discounttire"],
+}
 
-# -------------------- Multi-location coverage --------------------
-# 6 states + 12 metros
-MULTI_LOCATIONS = [
-    # States
-    {"name": "Florida, United States"},
-    #{"name": "Illinois, United States"},
-    #{"name": "North Carolina, United States"},
-    #{"name": "Texas, United States"},
-    #{"name": "California, United States"},
-    #{"name": "Pennsylvania, United States"},
-
-    # Metros
-    {"name": "Miami, Florida, United States"},
-    {"name": "Charlotte, North Carolina, United States"},
-    #{"name": "Philadelphia, Pennsylvania, United States"},
-    #{"name": "Pittsburgh, Pennsylvania, United States"},
-    #{"name": "New York, New York, United States"},
-    #{"name": "Chicago, Illinois, United States"},
-    #{"name": "Houston, Texas, United States"},
-    #{"name": "Austin, Texas, United States"},
-    #{"name": "Dallas, Texas, United States"},
-    {"name": "Los Angeles, California, United States"},
-    #{"name": "San Francisco, California, United States"}
+# Locations to query (SerpAPI "location" parameter strings).
+# You can add more. Each is a user-friendly label and a SerpAPI "location".
+LOCATIONS: List[Tuple[str, str]] = [
+    ("Florida, United States", "Florida, United States"),
+    ("Los Angeles, California, United States", "Los Angeles, California, United States"),
 ]
 
-# -------------------- Helpers: timestamps, filenames --------------------
-def _now_ts() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+# Logging level
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
-def _stamp() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+# If you want to throttle failures
+MAX_API_RETRIES = int(os.environ.get("MAX_API_RETRIES", "2"))
+RETRY_BACKOFF_BASE = float(os.environ.get("RETRY_BACKOFF_BASE", "1.6"))  # exp backoff base
 
-def _safe_name(s: str, limit=40) -> str:
-    return "".join(c for c in s.replace(" ", "_")[:limit] if c.isalnum() or c in ("_", "-"))
+# Column names used for writing results
+COLS = [
+    "Timestamp",
+    "Sheet",
+    "Keyword",
+    "Location",
+    "Position",
+    "Title",
+    "Price",
+    "Price Value",
+    "Old Price",
+    "Old Price Value",
+    "Rating",
+    "Reviews",
+    "Merchant Name",
+    "Product Link",
+    "Brand Match Domain",
+    "Matched Synonym",
+]
 
-def save_json(data, label, keyword):
-    if not SAVE_JSON:
-        return None
-    fname = f"shopping_{label}_{_safe_name(keyword)}_{_stamp()}.json"
-    with open(fname, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    logger.info(f"Saved JSON: {fname}")
-    return fname
+# ------------- Logging setup -------------
+logger = logging.getLogger("tracker")
+logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+_handler = logging.StreamHandler(sys.stdout)
+_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-7s | %(message)s"))
+logger.addHandler(_handler)
 
-# -------------------- Helpers: price parsing & discount detection --------------------
-_price_num_re = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
-_percent_re   = re.compile(r"(\d{1,3})\s*%")
+# ------------ Utilities ------------
 
-def parse_price_value(value) -> Optional[float]:
+def _now() -> str:
+    return pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+def _normalize_price_str(p: Optional[str]) -> Tuple[str, Optional[float]]:
     """
-    Extract a float from numeric or string price value (e.g., "$1,299.99").
+    Try to retain the price string and extract a numeric float if possible.
+    Examples:
+        "$123.45" -> ("$123.45", 123.45)
+        "US$1,199.00" -> ("US$1,199.00", 1199.00)
+        None -> ("", None)
     """
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        try:
-            return float(value)
-        except Exception:
-            return None
-    s = str(value)
-    m = _price_num_re.search(s.replace(",", ""))
-    if not m:
-        return None
+    if not p:
+        return "", None
+    s = str(p)
+    # keep original
+    raw = s
+    # strip non-digits except dot and comma
+    s2 = re.sub(r"[^0-9.,]", "", s)
+    # If there are commas, assume US formatting: remove commas then parse float
     try:
-        return float(m.group(0))
+        if s2.count(",") and s2.count("."):
+            # "1,299.99"
+            s3 = s2.replace(",", "")
+        else:
+            # Could be "1.234,56" (EU) – handle basic swap if comma as decimal
+            if s2.count(",") == 1 and s2.count(".") == 0:
+                s3 = s2.replace(",", ".")
+            else:
+                s3 = s2.replace(",", "")
+        val = float(s3)
+        return raw, val
     except Exception:
-        return None
+        return raw, None
 
-def get_price_fields(item: dict) -> Tuple[Optional[str], Optional[float], Optional[float]]:
-    """
-    Return (display_price_str, price_val, old_price_val).
-    Uses SerpApi fields: price, extracted_price, sale_price, extracted_sale_price,
-    old_price, extracted_old_price
-    """
-    price_str = item.get("price")
-    price_val = (
-        parse_price_value(item.get("extracted_price")) or
-        parse_price_value(price_str)
-    )
-    old_price_val = (
-        parse_price_value(item.get("extracted_old_price")) or
-        parse_price_value(item.get("old_price")) or
-        None
-    )
-    # Prefer sale price if present and lower
-    sale_price_val = (
-        parse_price_value(item.get("extracted_sale_price")) or
-        parse_price_value(item.get("sale_price")) or
-        None
-    )
-    if sale_price_val and (not price_val or sale_price_val < price_val):
-        price_val = sale_price_val
-    return price_str, price_val, old_price_val
+def _ensure_dir(p: str) -> None:
+    pathlib.Path(p).mkdir(parents=True, exist_ok=True)
 
-def detect_discount_percent(item: dict, price_val: Optional[float], old_price_val: Optional[float]) -> Optional[float]:
-    """
-    Calculate discount% primarily from old vs current price.
-    Fallback to parsing extensions texts like 'Save 20%'.
-    """
-    # from old vs price
-    if old_price_val and price_val and old_price_val > 0 and price_val < old_price_val:
-        pct = round((old_price_val - price_val) / old_price_val * 100.0, 2)
-        if pct > 0:
-            return pct
+def _is_excel(fname: str) -> bool:
+    low = fname.lower()
+    return low.endswith(".xlsx") or low.endswith(".xlsm") or low.endswith(".xls")
 
-    # from extensions text
-    exts = item.get("extensions") or []
-    best_pct = None
-    for ext in exts:
-        if not isinstance(ext, str):
-            continue
-        for m in _percent_re.finditer(ext):
+def _is_csv(fname: str) -> bool:
+    low = fname.lower()
+    return low.endswith(".csv")
+
+def _read_keywords_multi_sheet(path: str, only_sheets: Optional[List[str]] = None) -> Dict[str, List[str]]:
+    """
+    Returns {sheet_name: [keyword1, keyword2, ...]}
+    If CSV, will use pseudo-sheet "Sheet1".
+    Requires a 'keyword' column in each sheet/CSV.
+    """
+    store: Dict[str, List[str]] = {}
+    if _is_excel(path):
+        xl = pd.ExcelFile(path)
+        candidate_sheets = only_sheets or xl.sheet_names
+        for sh in candidate_sheets:
+            df = pd.read_excel(path, sheet_name=sh)
+            cols = [c.strip().lower() for c in df.columns]
+            if "keyword" not in cols:
+                logger.warning(f"Sheet '{sh}' has no 'keyword' column; skipping.")
+                continue
+            kw_col = df.columns[cols.index("keyword")]
+            kws = [str(x).strip() for x in df[kw_col].dropna().astype(str).tolist() if str(x).strip()]
+            if not kws:
+                logger.info(f"Sheet '{sh}' contains 0 keywords; skipping.")
+                continue
+            store[sh] = kws
+    elif _is_csv(path):
+        df = pd.read_csv(path)
+        cols = [c.strip().lower() for c in df.columns]
+        if "keyword" not in cols:
+            raise ValueError("CSV has no 'keyword' column.")
+        kw_col = df.columns[cols.index("keyword")]
+        kws = [str(x).strip() for x in df[kw_col].dropna().astype(str).tolist() if str(x).strip()]
+        store["Sheet1"] = kws
+    else:
+        raise FileNotFoundError(f"Unsupported keywords file: {path}")
+    total = sum(len(v) for v in store.values())
+    logger.info(f"Loaded {total} keywords across {len(store)} sheet(s)")
+    return store
+
+# ------------ Brands map ------------
+
+def load_brands_map(brands_json_path: Optional[str]) -> Dict[str, List[str]]:
+    """
+    Priority:
+      A) If brands_json_path is provided & valid JSON mapping {domain: [synonyms...]}, use it
+      B) Else use DEFAULT_BRANDS_MAP (dict in code; restored behavior)
+    """
+    if brands_json_path:
+        p = pathlib.Path(brands_json_path)
+        if p.is_file():
             try:
-                val = float(m.group(1))
-                # sanity filter
-                if 0 < val <= 95:
-                    best_pct = max(best_pct, val) if best_pct is not None else val
-            except Exception:
-                pass
-    return best_pct
+                data = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and all(isinstance(v, list) for v in data.values()):
+                    return data
+                else:
+                    logger.warning(f"Invalid brands JSON at '{brands_json_path}'; using default in-code dict.")
+            except Exception as e:
+                logger.warning(f"Failed reading brands JSON '{brands_json_path}': {e}; using default in-code dict.")
+    return DEFAULT_BRANDS_MAP
 
-# -------------------- Helpers: merchant extraction --------------------
-def normalize_host(u: str) -> str:
+# Build a compiled synonym matcher
+def compile_brand_matchers(brands_map: Dict[str, List[str]]) -> List[Tuple[str, re.Pattern]]:
     """
-    Return normalized host (strip www.)
+    Returns list of (domain, compiled_regex) where the regex matches any synonym word boundary-insensitive.
     """
-    try:
-        host = urlparse(u).netloc.lower()
-        if host.startswith("www."):
-            host = host[4:]
-        return host
-    except Exception:
-        return ""
+    compiled: List[Tuple[str, re.Pattern]] = []
+    for domain, synonyms in brands_map.items():
+        # turn synonyms into "word-ish" regex (space-insensitive-ish)
+        escaped = [re.escape(s.strip()) for s in synonyms if s.strip()]
+        if not escaped:
+            continue
+        pattern = r"(?i)\b(" + "|".join(escaped) + r")\b"
+        compiled.append((domain, re.compile(pattern)))
+    return compiled
 
-def extract_merchant_from_url(url: str) -> Optional[str]:
-    """
-    Derive merchant domain from product link.
-    - If direct merchant URL, return its host
-    - If google redirect (/url?url=...), extract the 'url' target host
-    """
-    try:
-        parsed = urlparse(url)
-        # direct merchant
-        if parsed.netloc and not parsed.netloc.endswith("google.com"):
-            return normalize_host(url)
-        # google redirect
-        qs = parse_qs(parsed.query)
-        if "url" in qs and qs["url"]:
-            return normalize_host(qs["url"][0])
-    except Exception:
-        pass
-    return None
+# ------------ SerpAPI client ------------
 
-# -------------------- Brand matching + row building --------------------
-def find_brands_in_shopping_results(shopping_results: List[Dict], brands_file: str, keyword: str, location_name: str = "Unknown") -> List[list]:
-    """
-    Match your brands in Shopping results, capture price/discount, and build CSV rows.
+class SerpApiError(Exception):
+    pass
 
-    Row format:
-      [Timestamp, Keyword, Location, Brand Domain, Product Title,
-       Price (display), Price Value, Old Price Value, Discount %,
-       Product Link, Merchant Name, Position, Rating, Reviews]
+def serp_shopping_search(
+    query: str,
+    location: str,
+    api_key: str,
+    num: int = 50,
+    gl: str = "us",
+    hl: str = "en",
+    google_domain: str = "google.com",
+    retries: int = 2,
+    backoff_base: float = 1.6,
+) -> Dict[str, Any]:
     """
-    with open(brands_file, "r", encoding="utf-8") as f:
-        brands = json.load(f)
-
-    # domain -> [domain, alias1, alias2, ...] all lowercased
-    brand_map = {
-        domain.lower(): [domain.lower()] + [a.lower() for a in aliases]
-        for domain, aliases in brands.items()
+    Calls SerpAPI "google_shopping" engine and returns raw JSON.
+    Retries on 429/5xx with exponential backoff.
+    """
+    url = "https://serpapi.com/search.json"
+    params = {
+        "engine": SERP_ENGINE,
+        "q": query,
+        "location": location,
+        "google_domain": google_domain,
+        "gl": gl,
+        "hl": hl,
+        "num": max(10, min(int(num), 100)),
+        "api_key": api_key,
     }
 
-    ts = _now_ts()
-    rows: List[List] = []
+    for attempt in range(1, max(1, retries) + 1):
+        try:
+            r = requests.get(url, params=params, timeout=60)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code in (429, 500, 502, 503, 504):
+                delay = (backoff_base ** (attempt - 1)) + random.uniform(0, 1.2)
+                logger.warning(f"SerpAPI HTTP {r.status_code} (attempt {attempt}/{retries}); sleeping {delay:.1f}s …")
+                time.sleep(delay)
+                continue
+            raise SerpApiError(f"SerpAPI HTTP {r.status_code}: {r.text[:240]}")
+        except requests.RequestException as e:
+            delay = (backoff_base ** (attempt - 1)) + random.uniform(0, 1.2)
+            logger.warning(f"SerpAPI error {e!r} (attempt {attempt}/{retries}); sleeping {delay:.1f}s …")
+            time.sleep(delay)
+    raise SerpApiError("SerpAPI request failed after retries.")
 
-    for idx, item in enumerate(shopping_results, 1):
-        product_title = item.get("title", "")
-        link          = item.get("link", "")
-        source        = item.get("source", "")
-        rating        = item.get("rating", 0)
-        reviews       = item.get("reviews", 0)
+# ------------ Result parsing & matching ------------
 
-        price_str, price_val, old_price_val = get_price_fields(item)
-        discount_pct = detect_discount_percent(item, price_val, old_price_val)
-
-        merchant_domain = None
-
-        # Method 1: merchant "source" text
-        if source:
-            sl = source.lower()
-            for domain, terms in brand_map.items():
-                if any(term in sl for term in terms):
-                    merchant_domain = domain
-                    break
-
-        # Method 2: from product link
-        if not merchant_domain and link:
-            extracted_domain = extract_merchant_from_url(link)
-            if extracted_domain:
-                for domain, terms in brand_map.items():
-                    core = domain[4:] if domain.startswith("www.") else domain
-                    if extracted_domain.endswith(core):
-                        merchant_domain = domain
-                        break
-
-        # Method 3: alias in product title
-        if not merchant_domain:
-            tl = product_title.lower()
-            for domain, terms in brand_map.items():
-                # skip index 0 (domain), check aliases only
-                if any(term in tl for term in terms[1:]):
-                    merchant_domain = domain
-                    break
-
-        if merchant_domain:
-            rows.append([
-                ts,
-                keyword,
-                location_name,
-                merchant_domain,
-                product_title[:200],
-                price_str if price_str is not None else "",
-                f"{price_val:.2f}" if isinstance(price_val, (int, float)) else "",
-                f"{old_price_val:.2f}" if isinstance(old_price_val, (int, float)) else "",
-                f"{discount_pct:.2f}" if isinstance(discount_pct, (int, float)) else "",
-                link,
-                source,
-                idx,
-                rating,
-                reviews
-            ])
-            logger.debug(f"Pos {idx} | {merchant_domain} | ${price_val} old=${old_price_val} disc={discount_pct}% | {product_title[:60]}")
-
-    return rows
-
-# -------------------- Location utilities --------------------
-def get_location_code(location_name: str) -> Optional[int]:
+def extract_shopping_results(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Query SerpApi Locations API for best-matching location code by name.
+    Extract relevant fields from SerpAPI shopping JSON.
     """
-    try:
-        resp = requests.get(
-            "https://serpapi.com/locations.json",
-            params={"q": location_name, "limit": 5},
-            timeout=12
-        )
-        data = resp.json()
-        if data:
-            return data[0].get("id")
-    except Exception as e:
-        logger.warning(f"Location code fetch failed for '{location_name}': {e}")
-    return None
+    results: List[Dict[str, Any]] = []
+    if not payload:
+        return results
 
-def resolve_location_codes(locations: List[Dict]) -> None:
-    """
-    Fill 'code' for any location lacking it. Fallback to name targeting if not found.
-    """
-    for loc in locations:
-        if not loc.get("code"):
-            code = get_location_code(loc["name"])
-            if code:
-                loc["code"] = code
-                logger.info(f"📍 Resolved '{loc['name']}' → code {code}")
-            else:
-                logger.info(f"📍 Using name fallback for '{loc['name']}' (no code found)")
+    # SerpAPI returns "shopping_results" list
+    items = payload.get("shopping_results") or []
+    for idx, it in enumerate(items, 1):
+        title = it.get("title") or ""
+        link = it.get("link") or it.get("product_link") or ""
+        merchant = it.get("source") or it.get("store") or it.get("seller") or ""
+        price_str = it.get("price") or it.get("extracted_price") or ""
+        extracted_price = it.get("extracted_price")
+        if extracted_price is None:
+            _, price_val = _normalize_price_str(price_str if isinstance(price_str, str) else str(price_str))
+        else:
+            price_val = float(extracted_price)
 
-# -------------------- SerpApi fetch --------------------
-def fetch_google_shopping_serpapi(keyword: str, location_override: Optional[Dict] = None, max_retries: int = 3) -> Optional[Dict]:
+        old_price_str = it.get("original_price") or it.get("old_price") or ""
+        old_price_val = None
+        if old_price_str:
+            _, old_price_val = _normalize_price_str(str(old_price_str))
+
+        rating = it.get("rating")
+        reviews = it.get("reviews")
+
+        results.append({
+            "Position": idx,
+            "Title": title,
+            "Product Link": link,
+            "Merchant Name": merchant,
+            "Price": price_str if isinstance(price_str, str) else (f"${price_val:.2f}" if price_val else ""),
+            "Price Value": price_val,
+            "Old Price": old_price_str if isinstance(old_price_str, str) else (f"${old_price_val:.2f}" if old_price_val else ""),
+            "Old Price Value": old_price_val,
+            "Rating": rating if isinstance(rating, (int, float)) else None,
+            "Reviews": reviews if isinstance(reviews, (int, float)) else None,
+        })
+    return results
+
+def match_brand(row: Dict[str, Any], brand_patterns: List[Tuple[str, re.Pattern]]) -> Tuple[Optional[str], Optional[str]]:
     """
-    Fetch Shopping results for a given keyword and location (name or code).
-    Attaches _location_name/_location_code to the returned dict.
+    Try matching any brand synonym in the Title or Merchant fields, returns (domain, matched_synonym) or (None, None).
     """
+    hay = " ".join([
+        str(row.get("Title", "") or ""),
+        str(row.get("Merchant Name", "") or "")
+    ]).lower()
+
+    for domain, creg in brand_patterns:
+        m = creg.search(hay)
+        if m:
+            return domain, m.group(1)
+    return None, None
+
+# ------------ Writer helpers ------------
+
+def write_xlsx_per_sheet(out_path: str, sheet2df: Dict[str, pd.DataFrame]) -> None:
+    """
+    Write one DataFrame per sheet into a single XLSX.
+    """
+    with pd.ExcelWriter(out_path, engine="xlsxwriter") as xw:
+        for sheet, df in sheet2df.items():
+            # Trim Excel sheet name safely
+            safe_sheet = sheet[:31] if sheet else "Sheet1"
+            # Avoid empty sheet names duplication
+            if not safe_sheet:
+                safe_sheet = "Sheet1"
+            df.to_excel(xw, sheet_name=safe_sheet, index=False)
+
+def write_csv_fallback(base_dir: str, sheet2df: Dict[str, pd.DataFrame]) -> None:
+    _ensure_dir(base_dir)
+    for sheet, df in sheet2df.items():
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", sheet)[:64] or "Sheet1"
+        p = pathlib.Path(base_dir) / f"{safe}.csv"
+        df.to_csv(p, index=False, encoding="utf-8-sig")
+
+# ------------ Main orchestration ------------
+
+def run() -> None:
+    # Sanity check for key
     if not SERPAPI_KEY:
         logger.error("Missing SERPAPI_KEY. Set it in your environment or .env file.")
-        return None
+        return
 
-    # Determine location
-    if location_override:
-        loc_name = location_override.get("name")
-        loc_code = location_override.get("code")
-    elif LOCATION_CODE:
-        loc_name = f"Code {LOCATION_CODE}"
-        loc_code = LOCATION_CODE
-    else:
-        loc_name = LOCATION or "United States"
-        loc_code = None
+    # Load brands map (JSON override optional)
+    brands_map = load_brands_map(BRANDS_JSON_PATH)
+    brand_patterns = compile_brand_matchers(brands_map)
 
-    for attempt in range(1, max_retries + 1):
-        try:
-            logger.info(f"SerpApi Shopping [{loc_name}] {attempt}/{max_retries}: {keyword}")
-            params = {
-                "engine": "google_shopping",
-                "q": keyword,
-                "api_key": SERPAPI_KEY,
-                "hl": "en",
-                "gl": COUNTRY,
-                "currency": CURRENCY,
-                "num": 60,
-                "no_cache": "true",
-            }
-            if loc_code:
-                params["location_code"] = loc_code
-            else:
-                params["location"] = loc_name
+    # Read keywords grouped by sheet
+    if not pathlib.Path(KEYWORDS_FILE).is_file():
+        logger.error(f"Keywords file not found: {KEYWORDS_FILE}")
+        return
 
-            resp = requests.get("https://serpapi.com/search", params=params, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
+    # Multi-sheet
+    sheets_kws = _read_keywords_multi_sheet(KEYWORDS_FILE, SHEETS if SHEETS else None)
 
-            if "error" in data:
-                logger.error(f"SerpApi error: {data['error']}")
-                if attempt < max_retries:
-                    time.sleep(4)
+    # Multi-location logging
+    logger.info(f"📍 Multi-location mode: {len(LOCATIONS)} locations")
+    for label, code in LOCATIONS:
+        # SerpAPI logs a resolved "location" string; we echo our human label
+        logger.info(f"   - {label} (code: {hashlib_stub(code)})")
+
+    # Process each sheet independently; accumulate per sheet
+    from collections import OrderedDict
+    out_frames: "OrderedDict[str, pd.DataFrame]" = OrderedDict()
+
+    total_keywords = sum(len(v) for v in sheets_kws.values())
+    logger.info(f"Loaded {total_keywords} keywords across {len(sheets_kws)} sheet(s)")
+
+    for sheet_name, keywords in sheets_kws.items():
+        logger.info(f"=== Processing sheet: {sheet_name} ({len(keywords)} keywords) ===")
+        rows: List[Dict[str, Any]] = []
+
+        for idx, kw in enumerate(keywords, 1):
+            logger.info("")
+            logger.info("=" * 60)
+            logger.info(f"[{idx}/{len(keywords)}] {kw}")
+            logger.info("=" * 60)
+
+            for loc_label, loc_string in LOCATIONS:
+                logger.info(f"📍 Location: {loc_label}")
+
+                # Call SerpAPI
+                try:
+                    payload = serp_shopping_search(
+                        query=kw,
+                        location=loc_string,
+                        api_key=SERPAPI_KEY,
+                        num=MAX_RESULTS,
+                        gl=GL,
+                        hl=HL,
+                        google_domain=GOOGLE_DOMAIN,
+                        retries=MAX_API_RETRIES,
+                        backoff_base=RETRY_BACKOFF_BASE,
+                    )
+                except SerpApiError as e:
+                    logger.error(str(e))
+                    logger.error("API error; skipping.")
+                    time.sleep(SLEEP_BETWEEN_CALLS)
                     continue
-                return None
 
-            data["_location_name"] = loc_name if loc_code else (loc_name or "United States")
-            data["_location_code"] = loc_code
-            return data
+                # Parse results
+                items = extract_shopping_results(payload)
+                if not items:
+                    logger.info("⚠️  No shopping results found in this location.")
+                    time.sleep(SLEEP_BETWEEN_CALLS)
+                    continue
 
-        except requests.exceptions.Timeout:
-            logger.warning("Timeout; retrying...")
-            if attempt < max_retries:
-                time.sleep(4)
-                continue
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request error: {e}")
-            if attempt < max_retries:
-                time.sleep(4)
-                continue
-        except Exception as e:
-            logger.error(f"Unexpected error: {e}")
-            break
+                # Filter by brand synonyms
+                matched_count = 0
+                for it in items:
+                    domain, syn = match_brand(it, brand_patterns)
+                    if not domain:
+                        # Not from a targeted brand; skip row
+                        continue
+                    matched_count += 1
 
-    return None
+                    out = {
+                        "Timestamp": _now(),
+                        "Sheet": sheet_name,
+                        "Keyword": kw,
+                        "Location": loc_label,
+                        "Position": it.get("Position"),
+                        "Title": it.get("Title"),
+                        "Price": it.get("Price"),
+                        "Price Value": it.get("Price Value"),
+                        "Old Price": it.get("Old Price"),
+                        "Old Price Value": it.get("Old Price Value"),
+                        "Rating": it.get("Rating"),
+                        "Reviews": it.get("Reviews"),
+                        "Merchant Name": it.get("Merchant Name"),
+                        "Product Link": it.get("Product Link"),
+                        "Brand Match Domain": domain,
+                        "Matched Synonym": syn,
+                    }
+                    rows.append(out)
 
-# -------------------- Orchestration per keyword --------------------
-def process_keyword(keyword: str, brands_file: str, location_override: Optional[Dict] = None) -> Tuple[List[list], str]:
-    """
-    Return (rows, status) for a single keyword + location.
-    """
-    data = fetch_google_shopping_serpapi(keyword, location_override)
-    if not data:
-        return [], "API_ERROR"
+                if matched_count == 0:
+                    logger.info("⚠️  No matching brand products found in this location.")
 
-    location_name = data.get("_location_name", "Unknown")
+                # Polite delay between keyword×location calls
+                time.sleep(SLEEP_BETWEEN_CALLS)
 
-    if SAVE_JSON:
-        save_json(data, "full_response", keyword)
+        # Build DataFrame for this sheet
+        df_sheet = pd.DataFrame(rows, columns=COLS) if rows else pd.DataFrame(columns=COLS)
+        out_frames[sheet_name] = df_sheet
 
-    shopping_results = data.get("shopping_results", [])
-    if not shopping_results:
-        logger.info(f"No shopping results for: {keyword}")
-        return [], "NO_SHOPPING"
-
-    rows = find_brands_in_shopping_results(shopping_results, brands_file, keyword, location_name)
-    return rows, "SUCCESS"
-
-# -------------------- Account check --------------------
-def check_serpapi_account():
+    # Attempt to write XLSX (one sheet per input sheet)
     try:
-        resp = requests.get("https://serpapi.com/account", params={"api_key": SERPAPI_KEY}, timeout=10)
-        data = resp.json()
-        if "error" in data:
-            logger.error(f"Account check failed: {data['error']}")
-            return None
-        logger.info(f"📊 SerpApi Plan: {data.get('plan_name','?')} | Searches left: {data.get('total_searches_left','?')}")
-        return data
-    except Exception as e:
-        logger.warning(f"Could not check account: {e}")
-        return None
-
-# -------------------- Runner --------------------
-def run():
-    logger.info("🛍️ Google Shopping Brand + Price/Discount Tracker")
-
-    # Validate mandatory files
-    if not os.path.exists(KEYWORDS_FILE):
-        logger.error(f"Missing keywords file: {KEYWORDS_FILE}")
-        return
-    if not os.path.exists(BRANDS_FILE):
-        logger.error(f"Missing brands file: {BRANDS_FILE}")
-        return
-
-    check_serpapi_account()
-
-    # Resolve location codes (optional but recommended)
-    if MULTI_LOCATIONS:
-        logger.info(f"📍 Multi-location mode: {len(MULTI_LOCATIONS)} locations")
-        resolve_location_codes(MULTI_LOCATIONS)
-        for loc in MULTI_LOCATIONS:
-            logger.info(f"   - {loc['name']} (code: {loc.get('code','N/A')})")
-    else:
-        if LOCATION_CODE:
-            logger.info(f"📍 Single location code: {LOCATION_CODE}")
+        write_xlsx_per_sheet(OUTPUT_XLSX, out_frames)
+        if all(df.empty for df in out_frames.values()):
+            logger.info("No rows collected; nothing to write.")
         else:
-            logger.info(f"📍 Single location: {LOCATION or 'United States'}")
+            logger.info(f"Results written to: {OUTPUT_XLSX}")
+    except PermissionError as e:
+        logger.error(f"Failed to write XLSX; falling back to single CSV: {e}")
+        write_csv_fallback(CSV_FALLBACK_DIR, out_frames)
+        logger.info("CSV fallback written (one CSV per sheet).")
 
-    # Load keywords
-    with open(KEYWORDS_FILE, "r", encoding="utf-8") as f:
-        keywords = [line.strip() for line in f if line.strip()]
-    logger.info(f"Loaded {len(keywords)} keywords")
+# small helper to avoid logging full location encoding (cosmetics)
+def hashlib_stub(s: str) -> str:
+    try:
+        import hashlib
+        return hashlib.md5(s.encode("utf-8")).hexdigest()[:24]
+    except Exception:
+        return "location"
 
-    # Initialize CSV (fresh file)
-    header = [
-        "Timestamp",
-        "Keyword",
-        "Location",
-        "Brand Domain",
-        "Product Title",
-        "Price",             # display string
-        "Price Value",       # numeric
-        "Old Price Value",   # numeric
-        "Discount %",        # numeric
-        "Product Link",
-        "Merchant Name",
-        "Position",
-        "Rating",
-        "Reviews"
-    ]
-    if os.path.exists(OUTPUT_FILE):
-        os.remove(OUTPUT_FILE)
-    with open(OUTPUT_FILE, mode="w", encoding="utf-8-sig", newline="") as f:
-        csv.writer(f).writerow(header)
-
-    stats = {"total": len(keywords), "success": 0, "no_shopping": 0, "api_error": 0, "products_found": 0}
-
-    # Choose locations to iterate
-    locations_to_check = MULTI_LOCATIONS if MULTI_LOCATIONS else [None]
-
-    for i, keyword in enumerate(keywords, 1):
-        logger.info(f"\n{'='*60}\n[{i}/{len(keywords)}] {keyword}\n{'='*60}")
-        try:
-            for idx_loc, location in enumerate(locations_to_check):
-                if location:
-                    logger.info(f"📍 Location: {location['name']}")
-
-                rows, status = process_keyword(keyword, BRANDS_FILE, location)
-
-                # Update keyword-level status (only once per keyword)
-                if idx_loc == 0:
-                    if status == "SUCCESS":
-                        stats["success"] += 1
-                    elif status == "NO_SHOPPING":
-                        stats["no_shopping"] += 1
-                    elif status == "API_ERROR":
-                        stats["api_error"] += 1
-
-                # Save rows
-                if rows:
-                    with open(OUTPUT_FILE, mode="a", encoding="utf-8-sig", newline="") as f:
-                        writer = csv.writer(f)
-                        writer.writerows(rows)
-                    stats["products_found"] += len(rows)
-
-                    # 'Position' column index = 11 after adding price/discount columns
-                    top_positions = sorted([row[11] for row in rows])[:3]
-                    logger.info(f"✅ {len(rows)} brand product(s) found | Top positions: {top_positions}")
-                else:
-                    logger.info(f"ℹ️ No matching brand products (Status: {status})")
-
-                # Small pause between locations
-                if location and idx_loc != len(locations_to_check) - 1:
-                    time.sleep(1.0)
-
-            # Rate-limit between keywords
-            if i < len(keywords):
-                delay = random.uniform(MIN_DELAY, MAX_DELAY)
-                logger.info(f"⏳ Waiting {delay:.1f}s...")
-                time.sleep(delay)
-
-        except KeyboardInterrupt:
-            logger.info("Interrupted by user.")
-            break
-        except Exception as e:
-            logger.error(f"Error processing '{keyword}': {e}")
-            stats["api_error"] += 1
-
-    # Summary
-    logger.info(f"\n{'='*60}")
-    logger.info("✅ PROCESSING COMPLETE")
-    logger.info(f"{'='*60}")
-    logger.info(f"📊 Total keywords: {stats['total']}")
-    pct = (stats['success']/stats['total']*100.0) if stats['total'] else 0.0
-    logger.info(f"📊 With shopping results: {stats['success']} ({pct:.1f}%)")
-    pct_ns = (stats['no_shopping']/stats['total']*100.0) if stats['total'] else 0.0
-    logger.info(f"📊 No shopping results: {stats['no_shopping']} ({pct_ns:.1f}%)")
-    logger.info(f"📊 API Errors: {stats['api_error']}")
-    logger.info(f"📊 Total brand products found: {stats['products_found']}")
-    logger.info(f"📁 CSV saved: {OUTPUT_FILE}")
-
-    check_serpapi_account()
-
-# Allow both styles: your file may call run() directly, or via CLI
 if __name__ == "__main__":
     run()
