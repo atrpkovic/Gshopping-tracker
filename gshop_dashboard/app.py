@@ -5,44 +5,92 @@ import plotly.graph_objects as go
 import pandas as pd
 import numpy as np
 from pathlib import Path
+import os
 
 # -------------------- Paths & Config --------------------
-DATA_PATH_MAIN = Path("data/google_shopping_brand_hits.csv")
-DATA_PATH_SAMPLE = Path("data/sample_google_shopping_brand_hits.csv")
 AUTO_REFRESH_MS = 90_000  # 90s
 THEME = dbc.themes.DARKLY  # change to FLATLY for light theme
 
-# -------------------- Load & prep data --------------------
+# ---- DATA PATH RESOLUTION (xlsx first, csv fallback) ----
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_PATH_ENV = os.getenv("GSHOP_OUTPUT")  # optional override
+
+CANDIDATES = [
+    DATA_PATH_ENV,
+    os.path.join(BASE_DIR, "data", "google_shopping_brand_hits.xlsx"),
+    os.path.join(BASE_DIR, "..", "google_shopping_brand_hits.xlsx"),
+    os.path.join(BASE_DIR, "data", "google_shopping_brand_hits.csv"),
+    os.path.join(BASE_DIR, "..", "google_shopping_brand_hits.csv"),
+]
+
+def _first_existing(paths):
+    for p in [p for p in paths if p]:
+        if os.path.exists(p):
+            return os.path.abspath(p)
+    return None
+
+def _read_any(path: str) -> pd.DataFrame:
+    _, ext = os.path.splitext(path.lower())
+    if ext == ".xlsx":
+        return pd.read_excel(path, engine="openpyxl")
+    elif ext == ".csv":
+        return pd.read_csv(path, encoding="utf-8-sig")
+    else:
+        raise ValueError(f"Unsupported data file type: {ext}")
+
 def load_df() -> pd.DataFrame:
-    path = DATA_PATH_MAIN if DATA_PATH_MAIN.exists() else DATA_PATH_SAMPLE
-    df = pd.read_csv(path, encoding="utf-8-sig")
+    path = _first_existing(CANDIDATES)
+    if not path:
+        raise FileNotFoundError(
+            "Cannot find google_shopping_brand_hits.[xlsx|csv]. "
+            "Searched:\n  - " + "\n  - ".join([p for p in CANDIDATES if p])
+        )
+    print(f"[dashboard] Loading data from: {path}")
+    return _read_any(path)
 
-    expected = [
-        "Timestamp","Keyword","Location","Brand Domain","Product Title",
-        "Price","Price Value","Old Price Value","Discount %",
-        "Product Link","Merchant Name","Position","Rating","Reviews"
-    ]
-    missing = [c for c in expected if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing columns in CSV: {missing}")
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    # Strip headers and unify common names
+    df.columns = [str(c).strip() for c in df.columns]
 
-    df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce", utc=True)
-    for col in ["Price Value","Old Price Value","Discount %","Position","Rating","Reviews"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    # Map Excel → app
+    rename_map = {
+        "Title": "Product Title",
+        "Merchant Name": "Merchant",
+        "Brand Domain": "Brand",          # if it ever appears
+        "Link": "Product Link",           # if it ever appears
+    }
+    df.rename(columns=rename_map, inplace=True)
 
-    def extract_state(loc):
-        if pd.isna(loc): return None
-        parts = [p.strip() for p in str(loc).split(",")]
-        if len(parts) >= 2:
-            return parts[-2] if parts[-1].lower() == "united states" else parts[-1]
-        return None
+    # Ensure core columns exist
+    for col in [
+        "Timestamp","Sheet","Keyword","Location","Position",
+        "Product Title","Price","Price Value","Old Price","Old Price Value",
+        "Rating","Reviews","Merchant","Product Link","Brand","Matched Synonym"
+    ]:
+        if col not in df.columns:
+            df[col] = pd.Series(dtype="object")
 
-    df["State"] = df["Location"].apply(extract_state)
-    df["Top3"] = (df["Position"] <= 3).astype(int)
-    df["Top10"] = (df["Position"] <= 10).astype(int)
+    # Types
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
+    num_cols = ["Position","Price Value","Old Price Value","Rating","Reviews"]
+    for c in num_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # Discount % (compute if missing)
+    if "Discount %" not in df.columns:
+        df["Discount %"] = np.where(
+            df["Old Price Value"].gt(0) & df["Price Value"].notna(),
+            (df["Old Price Value"] - df["Price Value"]) / df["Old Price Value"] * 100.0,
+            np.nan,
+        )
+    else:
+        df["Discount %"] = pd.to_numeric(df["Discount %"], errors="coerce")
+
     return df
 
-df = load_df()
+
+df = normalize_columns(load_df())
 
 # -------------------- App --------------------
 app = Dash(__name__, external_stylesheets=[THEME], title="Google Shopping Dashboard", suppress_callback_exceptions=True)
@@ -55,57 +103,45 @@ def kpi_card(title, value):
     )
 
 def controls(data: pd.DataFrame):
-    max_pos = int(np.nanmax(data["Position"])) if data["Position"].notna().any() else 60
+    pos_vals = pd.to_numeric(data.get("Position"), errors="coerce")
+    pos_min_default = int(np.nanmin(pos_vals)) if pos_vals.notna().any() else 1
+    pos_max_default = int(np.nanmax(pos_vals)) if pos_vals.notna().any() else 60
+
     return dbc.Card(dbc.CardBody([
         dbc.Row([
-            dbc.Col([
-                html.Label("Keyword"),
-                dcc.Dropdown(sorted(data["Keyword"].dropna().unique()), multi=True, id="kw",
-                             placeholder="Select Keyword", className="dropdown-black")
-            ], md=3),
-            dbc.Col([
-                html.Label("Brand"),
-                dcc.Dropdown(sorted(data["Brand Domain"].dropna().unique()), multi=True, id="brand",
-                             placeholder="Select Brand", className="dropdown-black")
-            ], md=3),
-            dbc.Col([
-                html.Label("Location"),
-                dcc.Dropdown(sorted(data["Location"].dropna().unique()), multi=True, id="loc",
-                             placeholder="Select Location", className="dropdown-black")
-            ], md=3),
-            dbc.Col([
-                html.Label("Date range"),
-                dcc.DatePickerRange(id="dates", minimum_nights=0)
-            ], md=3),
-        ], className="gy-2"),
-
-        html.Hr(),
-
+            dbc.Col([html.Label("Keyword"),
+                     dcc.Dropdown(sorted(data["Keyword"].dropna().unique()),
+                                  id="kw", multi=True)], md=3),
+            dbc.Col([html.Label("Brand"),
+                     dcc.Dropdown(sorted(data["Brand"].dropna().unique()),
+                                  id="Brand", multi=True)], md=3),
+            dbc.Col([html.Label("Location"),
+                     dcc.Dropdown(sorted(data["Location"].dropna().unique()),
+                                  id="loc", multi=True)], md=3),
+            dbc.Col([html.Label("Date range"),
+                     dcc.DatePickerRange(id="dates",
+                                         start_date=data["Timestamp"].min(),
+                                         end_date=data["Timestamp"].max())], md=3),
+        ], className="mb-2"),
         dbc.Row([
             dbc.Col([
                 html.Label("Position range"),
-                dcc.RangeSlider(min=1, max=max_pos, value=[1, min(10, max_pos)], id="pos",
-                                tooltip={"placement": "bottom", "always_visible": False})
+                dcc.RangeSlider(id="pos",
+                    min=pos_min_default, max=pos_max_default,
+                    value=[pos_min_default, pos_max_default])
             ], md=6),
             dbc.Col([
-                html.Label("Min discount (%)"),
-                dcc.Slider(min=0, max=60, step=1, value=0, id="min_disc",
-                           marks={i: f"{i}%" for i in range(0, 61, 10)},
-                           tooltip={"placement": "bottom", "always_visible": True},
-                           updatemode="drag", className="slider-clean")
-            ], md=3),
-            dbc.Col([
-                html.Label("Auto-refresh"),
-                dcc.Checklist(options=[{"label": " every 90s", "value": "on"}], value=["on"], id="refresh", inline=True)
-            ], md=3),
+                html.Label("Min. discount (%)"),
+                dcc.Slider(id="min_disc", min=0, max=80, step=1, value=0)
+            ], md=6),
         ]),
     ]), className="mb-4")
+
 
 app.layout = dbc.Container([
     html.Br(),
     html.H2("Google Shopping Dashboard", id="header-title"),
     html.Div("Explore placements, prices, and discounts across brands, keywords, and locations.", className="text-muted mb-3"),
-
     controls(df),
 
     dbc.Row([
@@ -127,27 +163,29 @@ app.layout = dbc.Container([
     dbc.Row([dbc.Col(dbc.Card(dbc.CardBody([dcc.Graph(id="fig_timeseries")])) , md=12)], className="gy-3"),
 
     # Results Table (native filter row; readable inputs)
-    # Results Table (native filter row; readable inputs)
     dbc.Card(dbc.CardBody([
         html.H5("Results Table"),
         dash_table.DataTable(
             id="table",
-            columns=[
-                {"name":"Time",           "id":"Timestamp"},
-                {"name":"Keyword",        "id":"Keyword"},
-                {"name":"Location",       "id":"Location"},
-                {"name":"Brand",          "id":"Brand Domain"},
-                {"name":"Product Title",  "id":"Product Title"},
-                {"name":"Price",          "id":"Price"},
-                {"name":"Price Value",    "id":"Price Value",    "type":"numeric"},
-                {"name":"Old Price",      "id":"Old Price Value","type":"numeric"},
-                {"name":"Discount %",     "id":"Discount %",     "type":"numeric"},
-                {"name":"Position",       "id":"Position",       "type":"numeric"},
-                {"name":"Rating",         "id":"Rating",         "type":"numeric"},
-                {"name":"Reviews",        "id":"Reviews",        "type":"numeric"},
-                {"name":"Link",           "id":"Product Link",   "presentation":"markdown"},
-                {"name":"Merchant",       "id":"Merchant Name"},
-            ],
+            columns= [
+                {"name":"Time",            "id":"Timestamp"},
+                {"name":"Sheet",           "id":"Sheet"},
+                {"name":"Keyword",         "id":"Keyword"},
+                {"name":"Location",        "id":"Location"},
+                {"name":"Position",        "id":"Position",        "type":"numeric"},
+                {"name":"Product Title",   "id":"Product Title"},
+                {"name":"Price",           "id":"Price"},
+                {"name":"Price Value",     "id":"Price Value",     "type":"numeric"},
+                {"name":"Old Price",       "id":"Old Price"},
+                {"name":"Old Price Value", "id":"Old Price Value", "type":"numeric"},
+                {"name":"Rating",          "id":"Rating",          "type":"numeric"},
+                {"name":"Reviews",         "id":"Reviews",         "type":"numeric"},
+                {"name":"Merchant",        "id":"Merchant"},
+                {"name":"Link",            "id":"Product Link",    "presentation":"markdown"},
+                {"name":"Brand",           "id":"Brand"},
+                {"name":"Matched Synonym", "id":"Matched Synonym"},
+                {"name":"Discount %",      "id":"Discount %",      "type":"numeric"},
+                ],
             style_as_list_view=True,
             page_size=25,
             sort_action="native",
@@ -159,29 +197,21 @@ app.layout = dbc.Container([
             fill_width=True,
             style_table={"overflowX": "auto", "height": "520px", "borderRadius": "12px", "minWidth": "100%"},
             style_header={"backgroundColor": "#0f0f10","color": "#ffffff","fontWeight": "700","border": "0"},
-        # Make filter inputs readable (pairs with CSS)
             style_filter={
-                "backgroundColor": "#ffffff",
-                "color": "#111",
-                "border": "0",
-                "fontSize": "13px",
-                "padding": "6px 8px",
-                "height": "38px",
+                "backgroundColor": "#ffffff","color": "#111","border": "0",
+                "fontSize": "13px","padding": "6px 8px","height": "38px",
             },
             style_cell={
-                "backgroundColor": "#ffffff",
-                "color": "#111",
-                "border": "0",
-                "padding": "10px",
-                "minWidth": "80px", "maxWidth": "340px",
-                "whiteSpace": "nowrap", "textOverflow": "ellipsis", "overflow": "hidden",
+                "backgroundColor": "#ffffff","color": "#111","border": "0","padding": "10px",
+                "minWidth": "80px","maxWidth": "340px","whiteSpace": "nowrap",
+                "textOverflow": "ellipsis","overflow": "hidden",
             },
             style_cell_conditional=[
                 {"if": {"column_id": "Product Title"}, "minWidth": "220px", "maxWidth": "420px"},
                 {"if": {"column_id": "Location"},      "minWidth": "180px"},
                 {"if": {"column_id": "Brand"},         "minWidth": "160px"},
                 {"if": {"column_id": "Price Value"},   "textAlign": "right"},
-                {"if": {"column_id": "Old Price"},     "textAlign": "right"},
+                {"if": {"column_id": "Old Price Value"},"textAlign": "right"},
                 {"if": {"column_id": "Discount %"},    "textAlign": "right"},
                 {"if": {"column_id": "Position"},      "textAlign": "right"},
                 {"if": {"column_id": "Rating"},        "textAlign": "right"},
@@ -195,25 +225,8 @@ app.layout = dbc.Container([
         )
     ]), className="mb-5"),
 
-
     dcc.Interval(id="interval", interval=AUTO_REFRESH_MS, n_intervals=0),
 ], fluid=True)
-
-# -------------------- Helpers --------------------
-def apply_filters(df: pd.DataFrame, kws, brands, locs, date_range, pos_range, min_disc):
-    dff = df.copy()
-    if kws: dff = dff[dff["Keyword"].isin(kws)]
-    if brands: dff = dff[dff["Brand Domain"].isin(brands)]
-    if locs: dff = dff[dff["Location"].isin(locs)]
-    if date_range and date_range[0] and date_range[1]:
-        start = pd.to_datetime(date_range[0])
-        end   = pd.to_datetime(date_range[1]) + pd.Timedelta(days=1)
-        dff = dff[(dff["Timestamp"] >= start) & (dff["Timestamp"] < end)]
-    if pos_range and len(pos_range) == 2:
-        dff = dff[(dff["Position"] >= pos_range[0]) & (dff["Position"] <= pos_range[1])]
-    if min_disc is not None and min_disc > 0:
-        dff = dff[(dff["Discount %"].fillna(0) >= float(min_disc))]
-    return dff
 
 # -------------------- Callbacks --------------------
 @callback(
@@ -234,103 +247,178 @@ def toggle_refresh(val):
     Output("fig_scatter","figure"),
     Output("fig_timeseries","figure"),
     Output("table","data"),
+    Input("interval","n_intervals"),
     Input("kw","value"),
-    Input("brand","value"),
+    Input("Brand","value"),
     Input("loc","value"),
     Input("dates","start_date"),
     Input("dates","end_date"),
-    Input("pos","value"),
+    Input("pos","value"),          # [min, max]
     Input("min_disc","value"),
-    Input("interval","n_intervals"),
 )
-def update_dashboard(kws, brands, locs, start, end, pos_range, min_disc, _tick):
-    global df
-    if DATA_PATH_MAIN.exists():
+def update_dashboard(n, kw_values, brand_values, loc_values, start_date, end_date, pos_range, min_disc):
+    dff = df.copy()
+
+    # Normalize inputs
+    kw_values = kw_values or []
+    brand_values = brand_values or []
+    loc_values = loc_values or []
+    pos_min, pos_max = (pos_range or [None, None])
+    if isinstance(pos_min, list):  # in case a tuple slips in weirdly
+        pos_min, pos_max = pos_min
+
+    # Date filter
+    if start_date or end_date:
+        if "Timestamp" in dff.columns:
+            dff["Timestamp"] = pd.to_datetime(dff["Timestamp"], errors="coerce")
+            if start_date:
+                dff = dff[dff["Timestamp"] >= pd.to_datetime(start_date)]
+            if end_date:
+                dff = dff[dff["Timestamp"] <= (pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1))]
+
+    # Keyword filter
+    if kw_values and "Keyword" in dff.columns:
+        dff = dff[dff["Keyword"].isin(kw_values)]
+
+    # Brand filter
+    brand_col = "Brand" if "Brand" in dff.columns else ("Brand Domain" if "Brand Domain" in dff.columns else None)
+    if brand_values and brand_col:
+        dff = dff[dff[brand_col].isin(brand_values)]
+
+    # Location filter
+    if loc_values and "Location" in dff.columns:
+        dff = dff[dff["Location"].isin(locs := loc_values)]
+
+    # Position range
+    if ("Position" in dff.columns) and (pos_min is not None) and (pos_max is not None):
+        pos_series = pd.to_numeric(dff["Position"], errors="coerce")
+        dff = dff[(pos_series >= int(pos_min)) & (pos_series <= int(pos_max))]
+
+    # Min discount
+    if ("Discount %" in dff.columns) and (min_disc is not None):
+        dff = dff[pd.to_numeric(dff["Discount %"], errors="coerce").fillna(0) >= float(min_disc)]
+
+    # Empty-safe UI
+    def empty_fig(msg):
+        f = go.Figure()
+        f.add_annotation(text=msg, xref="paper", yref="paper", x=0.5, y=0.5,
+                         showarrow=False, font=dict(size=14))
+        f.update_layout(margin=dict(l=20, r=20, t=30, b=20),
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="rgba(0,0,0,0)",
+                        xaxis_visible=False, yaxis_visible=False)
+        return f
+
+    if dff.empty:
+        return (
+            html.Div("No data for selected filters.", className="text-muted"),
+            "—", "—", "—",
+            empty_fig("No data"), empty_fig("No data"), empty_fig("No data"),
+            empty_fig("No data"), empty_fig("No data"),
+            [],
+        )
+
+    # KPIs
+    top3_share = 0.0
+    if "Position" in dff.columns:
+        pos_num = pd.to_numeric(dff["Position"], errors="coerce")
+        top3_share = (pos_num.le(3).mean() * 100.0) if pos_num.notna().any() else 0.0
+
+    avg_price = None
+    for col in ["Price Value", "Price"]:
+        if col in dff.columns:
+            avg_price = pd.to_numeric(dff[col], errors="coerce").mean()
+            break
+    avg_disc = pd.to_numeric(dff["Discount %"], errors="coerce").mean() if "Discount %" in dff.columns else None
+
+    kpi_rows = html.Div([
+        html.Div([html.Div("Top 3 Share", className="kpi-label"),
+                  html.Div(f"{top3_share:0.1f}%", className="kpi-value")], className="kpi"),
+        html.Div([html.Div("Avg Price", className="kpi-label"),
+                  html.Div("—" if avg_price is None or np.isnan(avg_price) else f"${avg_price:,.2f}", className="kpi-value")], className="kpi"),
+        html.Div([html.Div("Avg Discount", className="kpi-label"),
+                  html.Div("—" if avg_disc is None or np.isnan(avg_disc) else f"{avg_disc:0.1f}%", className="kpi-value")], className="kpi"),
+    ], className="kpi-row")
+
+    kpi_top3 = f"{top3_share:0.1f}%"
+    kpi_avgprice = "—" if avg_price is None or np.isnan(avg_price) else f"${avg_price:,.2f}"
+    kpi_avgdisc = "—" if avg_disc is None or np.isnan(avg_disc) else f"{avg_disc:0.1f}%"
+
+    # Brand share
+    brand_share_fig = empty_fig("No data")
+    if brand_col:
+        counts = dff[brand_col].fillna("Unknown").value_counts()
+        brand_share_fig = go.Figure(data=[go.Bar(x=counts.index.astype(str), y=counts.values)])
+        brand_share_fig.update_layout(title="Listings by Brand", margin=dict(l=30, r=20, t=40, b=60),
+                                      xaxis_title="Brand", yaxis_title="Count")
+
+    # Position distribution
+    pos_dist_fig = empty_fig("No data")
+    if "Position" in dff.columns:
+        pos_vals = pd.to_numeric(dff["Position"], errors="coerce").dropna()
+        if not pos_vals.empty:
+            pos_dist_fig = go.Figure(data=[go.Histogram(x=pos_vals, nbinsx=25)])
+            pos_dist_fig.update_layout(title="Position Distribution", xaxis_title="Position",
+                                       yaxis_title="Frequency", margin=dict(l=30, r=20, t=40, b=40))
+
+    # Heatmap: avg discount by Location × Brand
+    heatmap_fig = empty_fig("No discount data available for current filters")
+    if ("Discount %" in dff.columns) and brand_col and ("Location" in dff.columns):
         try:
-            new_df = pd.read_csv(DATA_PATH_MAIN, encoding="utf-8-sig")
-            if len(new_df) != len(df):
-                new_df["Timestamp"] = pd.to_datetime(new_df["Timestamp"], errors="coerce", utc=True)
-                for col in ["Price Value","Old Price Value","Discount %","Position","Rating","Reviews"]:
-                    new_df[col] = pd.to_numeric(new_df[col], errors="coerce")
-                def extract_state(loc):
-                    if pd.isna(loc): return None
-                    parts = [p.strip() for p in str(loc).split(",")]
-                    if len(parts) >= 2:
-                        return parts[-2] if parts[-1].lower()=="united states" else parts[-1]
-                    return None
-                new_df["State"] = new_df["Location"].apply(extract_state)
-                new_df["Top3"] = (new_df["Position"] <= 3).astype(int)
-                new_df["Top10"] = (new_df["Position"] <= 10).astype(int)
-                df = new_df
+            piv = dff.pivot_table(index="Location", columns=brand_col, values="Discount %", aggfunc="mean")
+            if piv is not None and not piv.empty:
+                heatmap_fig = go.Figure(
+                    data=go.Heatmap(z=piv.values, x=piv.columns.astype(str), y=piv.index.astype(str),
+                                    colorscale="Blues", colorbar=dict(title="Avg Discount %"))
+                )
+                heatmap_fig.update_layout(title="Avg Discount by Location × Brand", margin=dict(l=40, r=20, t=40, b=40))
         except Exception:
             pass
 
-    dff = apply_filters(df, kws, brands, locs, (start, end), pos_range, min_disc)
+    # Scatter: Price vs Position colored by brand
+    scatter_fig = empty_fig("No data")
+    if "Position" in dff.columns and (("Price Value" in dff.columns) or ("Price" in dff.columns)):
+        price_col = "Price Value" if "Price Value" in dff.columns else "Price"
+        tmp = dff[[price_col, "Position"] + ([brand_col] if brand_col else [])].copy()
+        tmp[price_col] = pd.to_numeric(tmp[price_col], errors="coerce")
+        tmp["Position"] = pd.to_numeric(tmp["Position"], errors="coerce")
+        tmp = tmp.dropna(subset=[price_col, "Position"])
+        if not tmp.empty:
+            scatter_fig = px.scatter(tmp, x="Position", y=price_col,
+                                     color=brand_col if brand_col else None,
+                                     title="Price vs Position",
+                                     labels={"Position": "Position", price_col: "Price"})
+            scatter_fig.update_layout(margin=dict(l=30, r=20, t=40, b=40))
 
-    n = len(dff)
-    top3_share = (dff["Top3"].sum()/n*100) if n else 0
-    avg_price = dff["Price Value"].mean() if n else np.nan
-    avg_disc = dff["Discount %"].mean() if n else np.nan
+    # Time series: avg position over time per brand
+    ts_fig = empty_fig("No data")
+    if "Timestamp" in dff.columns and "Position" in dff.columns:
+        ts = dff.copy()
+        ts["Timestamp"] = pd.to_datetime(ts["Timestamp"], errors="coerce")
+        ts["Position"] = pd.to_numeric(ts["Position"], errors="coerce")
+        ts = ts.dropna(subset=["Timestamp", "Position"])
+        if not ts.empty:
+            if brand_col:
+                grp = ts.groupby([pd.Grouper(key="Timestamp", freq="D"), brand_col])["Position"].mean().reset_index()
+                ts_fig = px.line(grp, x="Timestamp", y="Position", color=brand_col, title="Avg Position over Time")
+            else:
+                grp = ts.groupby(pd.Grouper(key="Timestamp", freq="D"))["Position"].mean().reset_index()
+                ts_fig = px.line(grp, x="Timestamp", y="Position", title="Avg Position over Time")
+            ts_fig.update_layout(margin=dict(l=30, r=20, t=40, b=40), yaxis_autorange="reversed")
 
-    kpi_rows = f"{n:,}"
-    kpi_top3 = f"{top3_share:.1f}%"
-    kpi_avgp = f"${avg_price:,.2f}" if pd.notna(avg_price) else "—"
-    kpi_avgd = f"{avg_disc:.1f}%" if pd.notna(avg_disc) else "—"
+    # Table data
+    table_cols = ["Timestamp", "Keyword", "Location", (brand_col or "Brand"), "Product Title",
+                  "Price", "Price Value", "Old Price Value", "Discount %",
+                  "Position", "Rating", "Reviews", "Product Link"]
+    table_cols = [c for c in table_cols if c in dff.columns]
+    table_data = dff[table_cols].sort_values(by=[c for c in ["Timestamp"] if c in table_cols],
+                                             ascending=False, na_position="last").to_dict("records")
 
-    d_top = dff[dff["Position"] <= 10]
-    if len(d_top):
-        s = d_top.groupby(["Brand Domain"])["Position"].count().sort_values(ascending=False).head(15)
-        fig1 = px.bar(s, orientation="v", title="Brand count in Top-10")
-        fig1.update_layout(margin=dict(l=10,r=10,t=40,b=10))
-    else:
-        fig1 = go.Figure().update_layout(title="Brand count in Top-10 (no data)")
-
-    if len(dff):
-        fig2 = px.histogram(dff, x="Position", nbins=40, title="Position Distribution")
-        fig2.update_xaxes(autorange="reversed")
-        fig2.update_layout(margin=dict(l=10,r=10,t=40,b=10))
-    else:
-        fig2 = go.Figure().update_layout(title="Position Distribution (no data)")
-
-    piv = dff.pivot_table(index="Location", columns="Brand Domain", values="Discount %", aggfunc="mean")
-    if piv.size:
-        fig3 = px.imshow(piv, aspect="auto", title="Avg Discount % (Brand × Location)", labels=dict(color="Discount %"))
-        fig3.update_layout(margin=dict(l=10,r=10,t=40,b=10))
-    else:
-        fig3 = go.Figure().update_layout(title="Avg Discount % (no data)")
-
-    if len(dff):
-        fig4 = px.scatter(
-            dff, x="Position", y="Price Value", color="Brand Domain",
-            hover_data=["Keyword","Location","Product Title"], size="Rating",
-            title="Price vs Position"
-        )
-        fig4.update_xaxes(autorange="reversed")
-        fig4.update_layout(margin=dict(l=10,r=10,t=40,b=10))
-    else:
-        fig4 = go.Figure().update_layout(title="Price vs Position (no data)")
-
-    if len(dff):
-        dff_day = dff.dropna(subset=["Timestamp"]).copy()
-        dff_day["day"] = dff_day["Timestamp"].dt.tz_convert(None).dt.date
-        s = dff_day.groupby("day")["Price Value"].mean().reset_index()
-        fig5 = px.line(s, x="day", y="Price Value", markers=True, title="Daily Avg Price")
-        fig5.update_layout(margin=dict(l=10,r=10,t=40,b=10))
-    else:
-        fig5 = go.Figure().update_layout(title="Daily Avg Price (no data)")
-
-    table_df = dff.copy()
-    def mk_link(url):
-        try:
-            return f"[Open]({url})" if pd.notna(url) and str(url).startswith("http") else ""
-        except Exception:
-            return ""
-    table_df["Product Link"] = table_df["Product Link"].apply(mk_link)
-    cols = ["Timestamp","Keyword","Location","Brand Domain","Product Title","Price","Price Value",
-            "Old Price Value","Discount %","Position","Rating","Reviews","Product Link","Merchant Name"]
-    table_df = table_df[cols].sort_values(["Timestamp","Position"], ascending=[False, True]).head(500)
-
-    return kpi_rows, kpi_top3, kpi_avgp, kpi_avgd, fig1, fig2, fig3, fig4, fig5, table_df.to_dict("records")
+    return (
+        kpi_rows, kpi_top3, kpi_avgprice, kpi_avgdisc,
+        brand_share_fig, pos_dist_fig, heatmap_fig, scatter_fig, ts_fig,
+        table_data,
+    )
 
 # -------------------- Run --------------------
 if __name__ == "__main__":
