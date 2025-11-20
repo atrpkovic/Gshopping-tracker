@@ -2,48 +2,51 @@
 # -*- coding: utf-8 -*-
 
 """
-Google Shopping brand-hit tracker (multi-sheet in/out, multi-location).
+Google Shopping brand-hit tracker (parallel, multi-sheet in/out, multi-location).
+
+APPEND-ONLY OUTPUTS:
+- XLSX: appends rows to each sheet in OUTPUT_XLSX; preserves existing headers/rows.
+- CSV:  appends rows to per-sheet CSV files in CSV_FALLBACK_DIR; header only on first write.
+
+Notes:
 - Loads SERPAPI_KEY from env (or .env if python-dotenv is installed)
 - Reads keywords from Excel/CSV. If Excel with multiple sheets: each sheet is processed separately.
-- Queries SerpAPI "google_shopping" for each keyword × each location
-- Matches results by brand synonyms against a brand map:
-    * Built-in DEFAULT_BRANDS_MAP (dict in code; previous behavior restored)
-    * Optional external JSON override (same shape), if BRANDS_JSON_PATH points to a file
-- Writes one output XLSX: one sheet per input sheet, keeping sheet names.
-- If output XLSX is locked (WinError 32), falls back to CSV files (one per sheet).
+- Queries SerpAPI "google_shopping" for each keyword × each location (in parallel)
+- Matches results by brand synonyms (in-code defaults; optional JSON override via BRANDS_JSON_PATH)
 
-Notes
-- You’ll need a SerpAPI key (env var SERPAPI_KEY).
-- Locations are Google Shopping uule/cid engine parameters handled via SerpAPI’s "location" parameter.
-- This script is intentionally verbose & defensive, to avoid silent failures.
-
-Author: (Your name)
+Env knobs:
+  SERPAPI_KEY=...                          # required
+  KEYWORDS_FILE=keywords.xlsx              # or keywords_test.xlsx while testing
+  OUTPUT_XLSX=google_shopping_brand_hits.xlsx
+  CSV_FALLBACK_DIR=brand_hits_csv
+  BRANDS_JSON_PATH=brands_final.json       # optional; overrides in-code dict
+  MAX_WORKERS=6
+  SERPAPI_QPS=2
+  MAX_RESULTS=50
+  MAX_API_RETRIES=2
+  RETRY_BACKOFF_BASE=1.6
+  LOG_LEVEL=INFO
 """
 
 from __future__ import annotations
 
 import os
 import re
-import io
 import sys
 import json
 import time
-import math
-import copy
-import csv
-import uuid
-import atexit
 import random
 import logging
 import pathlib
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+from collections import defaultdict, OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 # --- Optional .env loader (safe if not installed) ---
 try:
     from pathlib import Path
     from dotenv import load_dotenv  # type: ignore
-    # 1) load .env next to this file; 2) also load from CWD as fallback
     load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
     load_dotenv()
 except Exception:
@@ -53,66 +56,54 @@ import requests
 import pandas as pd
 
 # ----------------------------
-# Configuration (edit as needed)
+# Configuration
 # ----------------------------
-
-# Path to your keywords file:
-# - If Excel: multi-sheet supported. Every sheet must have a column named "keyword".
-# - If CSV: single sheet; the sheet name will be "Sheet1" for output.
-KEYWORDS_FILE = os.environ.get("KEYWORDS_FILE", "keywords_test.xlsx")  # you can set to "keywords_test.xlsx" while testing
-
-# Optional explicit list of sheets to use (comma-separated), e.g. "sizes,brands"
-# If not set, process all sheets (Excel) or the single CSV.
+KEYWORDS_FILE = os.environ.get("KEYWORDS_FILE", "keywords.xlsx")  # set to "keywords_test.xlsx" while testing
 SHEETS = [s.strip() for s in os.environ.get("KEYWORDS_SHEETS", "").split(",") if s.strip()]
 
-# Output file name (XLSX)
 OUTPUT_XLSX = os.environ.get("OUTPUT_XLSX", "google_shopping_brand_hits.xlsx")
-
-# Optional CSV fallback directory (used if XLSX is locked)
 CSV_FALLBACK_DIR = os.environ.get("CSV_FALLBACK_DIR", "brand_hits_csv")
 
-# SerpAPI key must be present
 SERPAPI_KEY = os.getenv("SERPAPI_KEY")
-
-# Engine config
 SERP_ENGINE = "google_shopping"
 GOOGLE_DOMAIN = os.environ.get("GOOGLE_DOMAIN", "google.com")
-GL = os.environ.get("GL", "us")      # country
-HL = os.environ.get("HL", "en")      # language
+GL = os.environ.get("GL", "us")
+HL = os.environ.get("HL", "en")
 
-# Delay between calls to be polite (seconds)
-SLEEP_BETWEEN_CALLS = float(os.environ.get("SLEEP_BETWEEN_CALLS", "1.0"))
-
-# Per-keyword maximum shopping results pulled (SerpAPI supports "num" up to ~100)
+# Speed / politeness
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "6"))
+SERPAPI_QPS = float(os.environ.get("SERPAPI_QPS", "2"))  # global QPS cap across all workers
 MAX_RESULTS = int(os.environ.get("MAX_RESULTS", "50"))
+MAX_API_RETRIES = int(os.environ.get("MAX_API_RETRIES", "2"))
+RETRY_BACKOFF_BASE = float(os.environ.get("RETRY_BACKOFF_BASE", "1.6"))
 
-# Optional external brands JSON override path. If provided & valid, will override the default dict below.
 BRANDS_JSON_PATH = os.environ.get("BRANDS_JSON_PATH", "").strip() or None
 
-# Restore in-code dict loading: minimal, you can expand it. External JSON still can override this.
+# Default brand map (override with BRANDS_JSON_PATH if provided)
 DEFAULT_BRANDS_MAP: Dict[str, List[str]] = {
     "prioritytire.com": ["priority tire", "prioritytire"],
     "simpletire.com":   ["simple tire", "simpletire"],
-    # Feel free to add more here if desired (fallback only)
-    # "tirerack.com": ["tire rack", "tirerack"],
-    # "discounttire.com": ["discount tire", "discounttire"],
+    "tireagent.com":    ["tire agent", "tireagent"],
+    "gigatires.com":    ["giga tires", "gigatires"],
+    "tireseasy.com":    ["tireseasy", "tires easy"],
+    "tirerack.com":     ["tirerack", "tire rack"],
+    "amazon.com":       ["amazon"],
+    "ebay.com":         ["ebay"],
+    "walmart.com":      ["walmart"],
 }
 
-# Locations to query (SerpAPI "location" parameter strings).
-# You can add more. Each is a user-friendly label and a SerpAPI "location".
+# Locations (label, SerpAPI "location" input)
 LOCATIONS: List[Tuple[str, str]] = [
-    ("Florida, United States", "Florida, United States"),
-    ("Los Angeles, California, United States", "Los Angeles, California, United States"),
+    ("Florida, United States",        "Florida, United States"),
+    ("Texas, United States",          "Texas, United States"),
+    ("North Carolina, United States", "North Carolina, United States"),
+    ("Pennsylvania, United States",   "Pennsylvania, United States"),
+    ("California, United States",     "California, United States"),
+    ("Illinois, United States",       "Illinois, United States"),
 ]
 
-# Logging level
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
-# If you want to throttle failures
-MAX_API_RETRIES = int(os.environ.get("MAX_API_RETRIES", "2"))
-RETRY_BACKOFF_BASE = float(os.environ.get("RETRY_BACKOFF_BASE", "1.6"))  # exp backoff base
-
-# Column names used for writing results
 COLS = [
     "Timestamp",
     "Sheet",
@@ -128,70 +119,55 @@ COLS = [
     "Reviews",
     "Merchant Name",
     "Product Link",
-    "Brand Match Domain",
+    "Brand",
     "Matched Synonym",
 ]
 
-# ------------- Logging setup -------------
+# ------------- Logging -------------
 logger = logging.getLogger("tracker")
 logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 _handler = logging.StreamHandler(sys.stdout)
 _handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-7s | %(message)s"))
 logger.addHandler(_handler)
+from pathlib import Path
 
-# ------------ Utilities ------------
+LOG_FILE = Path(__file__).with_suffix(".log")
+
+file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-7s | %(message)s"))
+logger.addHandler(file_handler)
+
+# ------------- Helpers -------------
 
 def _now() -> str:
     return pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-
-def _normalize_price_str(p: Optional[str]) -> Tuple[str, Optional[float]]:
-    """
-    Try to retain the price string and extract a numeric float if possible.
-    Examples:
-        "$123.45" -> ("$123.45", 123.45)
-        "US$1,199.00" -> ("US$1,199.00", 1199.00)
-        None -> ("", None)
-    """
-    if not p:
-        return "", None
-    s = str(p)
-    # keep original
-    raw = s
-    # strip non-digits except dot and comma
-    s2 = re.sub(r"[^0-9.,]", "", s)
-    # If there are commas, assume US formatting: remove commas then parse float
-    try:
-        if s2.count(",") and s2.count("."):
-            # "1,299.99"
-            s3 = s2.replace(",", "")
-        else:
-            # Could be "1.234,56" (EU) – handle basic swap if comma as decimal
-            if s2.count(",") == 1 and s2.count(".") == 0:
-                s3 = s2.replace(",", ".")
-            else:
-                s3 = s2.replace(",", "")
-        val = float(s3)
-        return raw, val
-    except Exception:
-        return raw, None
-
-def _ensure_dir(p: str) -> None:
-    pathlib.Path(p).mkdir(parents=True, exist_ok=True)
 
 def _is_excel(fname: str) -> bool:
     low = fname.lower()
     return low.endswith(".xlsx") or low.endswith(".xlsm") or low.endswith(".xls")
 
 def _is_csv(fname: str) -> bool:
-    low = fname.lower()
-    return low.endswith(".csv")
+    return fname.lower().endswith(".csv")
+
+def _normalize_price_str(p: Optional[str]) -> Tuple[str, Optional[float]]:
+    if not p:
+        return "", None
+    s = str(p)
+    raw = s
+    s2 = re.sub(r"[^0-9.,]", "", s)
+    try:
+        if s2.count(",") and s2.count("."):
+            s3 = s2.replace(",", "")
+        else:
+            if s2.count(",") == 1 and s2.count(".") == 0:
+                s3 = s2.replace(",", ".")
+            else:
+                s3 = s2.replace(",", "")
+        return raw, float(s3)
+    except Exception:
+        return raw, None
 
 def _read_keywords_multi_sheet(path: str, only_sheets: Optional[List[str]] = None) -> Dict[str, List[str]]:
-    """
-    Returns {sheet_name: [keyword1, keyword2, ...]}
-    If CSV, will use pseudo-sheet "Sheet1".
-    Requires a 'keyword' column in each sheet/CSV.
-    """
     store: Dict[str, List[str]] = {}
     if _is_excel(path):
         xl = pd.ExcelFile(path)
@@ -222,14 +198,7 @@ def _read_keywords_multi_sheet(path: str, only_sheets: Optional[List[str]] = Non
     logger.info(f"Loaded {total} keywords across {len(store)} sheet(s)")
     return store
 
-# ------------ Brands map ------------
-
 def load_brands_map(brands_json_path: Optional[str]) -> Dict[str, List[str]]:
-    """
-    Priority:
-      A) If brands_json_path is provided & valid JSON mapping {domain: [synonyms...]}, use it
-      B) Else use DEFAULT_BRANDS_MAP (dict in code; restored behavior)
-    """
     if brands_json_path:
         p = pathlib.Path(brands_json_path)
         if p.is_file():
@@ -237,28 +206,47 @@ def load_brands_map(brands_json_path: Optional[str]) -> Dict[str, List[str]]:
                 data = json.loads(p.read_text(encoding="utf-8"))
                 if isinstance(data, dict) and all(isinstance(v, list) for v in data.values()):
                     return data
-                else:
-                    logger.warning(f"Invalid brands JSON at '{brands_json_path}'; using default in-code dict.")
+                logger.warning(f"Invalid brands JSON at '{brands_json_path}'; using in-code defaults.")
             except Exception as e:
-                logger.warning(f"Failed reading brands JSON '{brands_json_path}': {e}; using default in-code dict.")
+                logger.warning(f"Failed reading brands JSON '{brands_json_path}': {e}; using in-code defaults.")
     return DEFAULT_BRANDS_MAP
 
-# Build a compiled synonym matcher
 def compile_brand_matchers(brands_map: Dict[str, List[str]]) -> List[Tuple[str, re.Pattern]]:
-    """
-    Returns list of (domain, compiled_regex) where the regex matches any synonym word boundary-insensitive.
-    """
     compiled: List[Tuple[str, re.Pattern]] = []
     for domain, synonyms in brands_map.items():
-        # turn synonyms into "word-ish" regex (space-insensitive-ish)
-        escaped = [re.escape(s.strip()) for s in synonyms if s.strip()]
-        if not escaped:
+        esc = [re.escape(s.strip()) for s in synonyms if s.strip()]
+        if not esc:
             continue
-        pattern = r"(?i)\b(" + "|".join(escaped) + r")\b"
+        pattern = r"(?i)\b(" + "|".join(esc) + r")\b"
         compiled.append((domain, re.compile(pattern)))
     return compiled
 
-# ------------ SerpAPI client ------------
+# ------------- Polite global rate limiter -------------
+
+class GlobalRateLimiter:
+    """
+    Very simple global QPS limiter shared by all threads.
+    Ensures we don't exceed SERPAPI_QPS across the whole process.
+    """
+    def __init__(self, qps: float):
+        self.min_interval = 1.0 / max(0.001, qps)
+        self._lock = Lock()
+        self._last = 0.0
+
+    def wait(self):
+        with self._lock:
+            now = time.time()
+            elapsed = now - self._last
+            if elapsed < self.min_interval:
+                sleep_s = self.min_interval - elapsed + random.uniform(0.0, 0.05)
+                time.sleep(sleep_s)
+                self._last = time.time()
+            else:
+                self._last = now
+
+rate_limiter = GlobalRateLimiter(SERPAPI_QPS)
+
+# ------------- SerpAPI -------------
 
 class SerpApiError(Exception):
     pass
@@ -274,10 +262,6 @@ def serp_shopping_search(
     retries: int = 2,
     backoff_base: float = 1.6,
 ) -> Dict[str, Any]:
-    """
-    Calls SerpAPI "google_shopping" engine and returns raw JSON.
-    Retries on 429/5xx with exponential backoff.
-    """
     url = "https://serpapi.com/search.json"
     params = {
         "engine": SERP_ENGINE,
@@ -291,6 +275,9 @@ def serp_shopping_search(
     }
 
     for attempt in range(1, max(1, retries) + 1):
+        # global QPS gate
+        rate_limiter.wait()
+
         try:
             r = requests.get(url, params=params, timeout=60)
             if r.status_code == 200:
@@ -305,19 +292,15 @@ def serp_shopping_search(
             delay = (backoff_base ** (attempt - 1)) + random.uniform(0, 1.2)
             logger.warning(f"SerpAPI error {e!r} (attempt {attempt}/{retries}); sleeping {delay:.1f}s …")
             time.sleep(delay)
+
     raise SerpApiError("SerpAPI request failed after retries.")
 
-# ------------ Result parsing & matching ------------
+# ------------- Parsing & matching -------------
 
 def extract_shopping_results(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Extract relevant fields from SerpAPI shopping JSON.
-    """
     results: List[Dict[str, Any]] = []
     if not payload:
         return results
-
-    # SerpAPI returns "shopping_results" list
     items = payload.get("shopping_results") or []
     for idx, it in enumerate(items, 1):
         title = it.get("title") or ""
@@ -353,172 +336,244 @@ def extract_shopping_results(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     return results
 
 def match_brand(row: Dict[str, Any], brand_patterns: List[Tuple[str, re.Pattern]]) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Try matching any brand synonym in the Title or Merchant fields, returns (domain, matched_synonym) or (None, None).
-    """
     hay = " ".join([
         str(row.get("Title", "") or ""),
         str(row.get("Merchant Name", "") or "")
     ]).lower()
-
     for domain, creg in brand_patterns:
         m = creg.search(hay)
         if m:
             return domain, m.group(1)
     return None, None
 
-# ------------ Writer helpers ------------
+# ------------- Append-ONLY writing -------------
 
-def write_xlsx_per_sheet(out_path: str, sheet2df: Dict[str, pd.DataFrame]) -> None:
+def append_xlsx_per_sheet(out_path: str, sheet2df: Dict[str, pd.DataFrame]) -> None:
     """
-    Write one DataFrame per sheet into a single XLSX.
+    Appends rows to an XLSX book per sheet, preserving headers.
+    - If file doesn't exist: create and write headers + rows.
+    - If sheet doesn't exist: create with headers + rows.
+    - If sheet exists: append rows under existing header order.
     """
-    with pd.ExcelWriter(out_path, engine="xlsxwriter") as xw:
+    from openpyxl import load_workbook, Workbook
+
+    p = pathlib.Path(out_path)
+    if not p.exists():
+        # Create new workbook with all sheets + headers in one go
+        wb = Workbook()
+        # Remove default sheet
+        default_ws = wb.active
+        wb.remove(default_ws)
         for sheet, df in sheet2df.items():
-            # Trim Excel sheet name safely
-            safe_sheet = sheet[:31] if sheet else "Sheet1"
-            # Avoid empty sheet names duplication
-            if not safe_sheet:
-                safe_sheet = "Sheet1"
-            df.to_excel(xw, sheet_name=safe_sheet, index=False)
+            ws = wb.create_sheet(title=(sheet or "Sheet1")[:31])
+            # Ensure full column set in defined order
+            df2 = df.reindex(columns=COLS, fill_value="")
+            # Write header
+            ws.append(COLS)
+            # Write rows
+            for row in df2.itertuples(index=False, name=None):
+                ws.append(row)
+        wb.save(out_path)
+        return
 
-def write_csv_fallback(base_dir: str, sheet2df: Dict[str, pd.DataFrame]) -> None:
-    _ensure_dir(base_dir)
+    # File exists -> open and append
+    wb = load_workbook(out_path)
     for sheet, df in sheet2df.items():
-        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", sheet)[:64] or "Sheet1"
-        p = pathlib.Path(base_dir) / f"{safe}.csv"
-        df.to_csv(p, index=False, encoding="utf-8-sig")
+        # Nothing to append
+        if df is None or df.empty:
+            # Ensure sheet exists with header at least
+            if sheet not in wb.sheetnames:
+                ws = wb.create_sheet(title=(sheet or "Sheet1")[:31])
+                ws.append(COLS)
+            continue
 
-# ------------ Main orchestration ------------
-
-def run() -> None:
-    # Sanity check for key
-    if not SERPAPI_KEY:
-        logger.error("Missing SERPAPI_KEY. Set it in your environment or .env file.")
-        return
-
-    # Load brands map (JSON override optional)
-    brands_map = load_brands_map(BRANDS_JSON_PATH)
-    brand_patterns = compile_brand_matchers(brands_map)
-
-    # Read keywords grouped by sheet
-    if not pathlib.Path(KEYWORDS_FILE).is_file():
-        logger.error(f"Keywords file not found: {KEYWORDS_FILE}")
-        return
-
-    # Multi-sheet
-    sheets_kws = _read_keywords_multi_sheet(KEYWORDS_FILE, SHEETS if SHEETS else None)
-
-    # Multi-location logging
-    logger.info(f"📍 Multi-location mode: {len(LOCATIONS)} locations")
-    for label, code in LOCATIONS:
-        # SerpAPI logs a resolved "location" string; we echo our human label
-        logger.info(f"   - {label} (code: {hashlib_stub(code)})")
-
-    # Process each sheet independently; accumulate per sheet
-    from collections import OrderedDict
-    out_frames: "OrderedDict[str, pd.DataFrame]" = OrderedDict()
-
-    total_keywords = sum(len(v) for v in sheets_kws.values())
-    logger.info(f"Loaded {total_keywords} keywords across {len(sheets_kws)} sheet(s)")
-
-    for sheet_name, keywords in sheets_kws.items():
-        logger.info(f"=== Processing sheet: {sheet_name} ({len(keywords)} keywords) ===")
-        rows: List[Dict[str, Any]] = []
-
-        for idx, kw in enumerate(keywords, 1):
-            logger.info("")
-            logger.info("=" * 60)
-            logger.info(f"[{idx}/{len(keywords)}] {kw}")
-            logger.info("=" * 60)
-
-            for loc_label, loc_string in LOCATIONS:
-                logger.info(f"📍 Location: {loc_label}")
-
-                # Call SerpAPI
-                try:
-                    payload = serp_shopping_search(
-                        query=kw,
-                        location=loc_string,
-                        api_key=SERPAPI_KEY,
-                        num=MAX_RESULTS,
-                        gl=GL,
-                        hl=HL,
-                        google_domain=GOOGLE_DOMAIN,
-                        retries=MAX_API_RETRIES,
-                        backoff_base=RETRY_BACKOFF_BASE,
-                    )
-                except SerpApiError as e:
-                    logger.error(str(e))
-                    logger.error("API error; skipping.")
-                    time.sleep(SLEEP_BETWEEN_CALLS)
-                    continue
-
-                # Parse results
-                items = extract_shopping_results(payload)
-                if not items:
-                    logger.info("⚠️  No shopping results found in this location.")
-                    time.sleep(SLEEP_BETWEEN_CALLS)
-                    continue
-
-                # Filter by brand synonyms
-                matched_count = 0
-                for it in items:
-                    domain, syn = match_brand(it, brand_patterns)
-                    if not domain:
-                        # Not from a targeted brand; skip row
-                        continue
-                    matched_count += 1
-
-                    out = {
-                        "Timestamp": _now(),
-                        "Sheet": sheet_name,
-                        "Keyword": kw,
-                        "Location": loc_label,
-                        "Position": it.get("Position"),
-                        "Title": it.get("Title"),
-                        "Price": it.get("Price"),
-                        "Price Value": it.get("Price Value"),
-                        "Old Price": it.get("Old Price"),
-                        "Old Price Value": it.get("Old Price Value"),
-                        "Rating": it.get("Rating"),
-                        "Reviews": it.get("Reviews"),
-                        "Merchant Name": it.get("Merchant Name"),
-                        "Product Link": it.get("Product Link"),
-                        "Brand Match Domain": domain,
-                        "Matched Synonym": syn,
-                    }
-                    rows.append(out)
-
-                if matched_count == 0:
-                    logger.info("⚠️  No matching brand products found in this location.")
-
-                # Polite delay between keyword×location calls
-                time.sleep(SLEEP_BETWEEN_CALLS)
-
-        # Build DataFrame for this sheet
-        df_sheet = pd.DataFrame(rows, columns=COLS) if rows else pd.DataFrame(columns=COLS)
-        out_frames[sheet_name] = df_sheet
-
-    # Attempt to write XLSX (one sheet per input sheet)
-    try:
-        write_xlsx_per_sheet(OUTPUT_XLSX, out_frames)
-        if all(df.empty for df in out_frames.values()):
-            logger.info("No rows collected; nothing to write.")
+        safe_sheet = (sheet or "Sheet1")[:31]
+        if safe_sheet in wb.sheetnames:
+            ws = wb[safe_sheet]
+            # Ensure header row exists; if empty sheet, write header
+            if ws.max_row < 1 or all(c.value is None for c in ws[1]):
+                ws.append(COLS)
+                existing_headers = COLS
+            else:
+                existing_headers = [cell.value for cell in ws[1]]
+                # If headers are missing/partial, normalize to COLS
+                if not existing_headers or any(h is None for h in existing_headers):
+                    existing_headers = COLS
+                    # (Optionally could rewrite header row, but append works as long as we align df)
+            # Align df columns to existing header order; add blanks for missing
+            df2 = df.copy()
+            for h in existing_headers:
+                if h not in df2.columns:
+                    df2[h] = ""
+            df2 = df2[existing_headers]
+            for row in df2.itertuples(index=False, name=None):
+                ws.append(row)
         else:
-            logger.info(f"Results written to: {OUTPUT_XLSX}")
-    except PermissionError as e:
-        logger.error(f"Failed to write XLSX; falling back to single CSV: {e}")
-        write_csv_fallback(CSV_FALLBACK_DIR, out_frames)
-        logger.info("CSV fallback written (one CSV per sheet).")
+            ws = wb.create_sheet(title=safe_sheet)
+            ws.append(COLS)
+            df2 = df.reindex(columns=COLS, fill_value="")
+            for row in df2.itertuples(index=False, name=None):
+                ws.append(row)
 
-# small helper to avoid logging full location encoding (cosmetics)
+    wb.save(out_path)
+
+def append_csv_folder(base_dir: str, sheet2df: Dict[str, pd.DataFrame]) -> None:
+    """
+    Appends rows to CSV per sheet. Creates file + header if missing.
+    """
+    base = pathlib.Path(base_dir)
+    base.mkdir(parents=True, exist_ok=True)
+
+    for sheet, df in sheet2df.items():
+        if df is None or df.empty:
+            # ensure a file exists with header (optional; skip to avoid empty files)
+            continue
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", sheet)[:64] or "Sheet1"
+        p = base / f"{safe}.csv"
+
+        df2 = df.reindex(columns=COLS, fill_value="")
+        write_header = not p.exists()
+        mode = "a" if p.exists() else "w"
+        df2.to_csv(p, index=False, encoding="utf-8-sig", mode=mode, header=write_header)
+
+# ------------- Task & worker -------------
+
 def hashlib_stub(s: str) -> str:
     try:
         import hashlib
         return hashlib.md5(s.encode("utf-8")).hexdigest()[:24]
     except Exception:
         return "location"
+
+def _build_tasks(sheets_kws: Dict[str, List[str]]) -> List[Tuple[str, str, str, str]]:
+    """
+    Returns list of (sheet_name, keyword, loc_label, loc_input) tasks.
+    """
+    tasks: List[Tuple[str, str, str, str]] = []
+    for sheet, kws in sheets_kws.items():
+        for kw in kws:
+            for (loc_label, loc_string) in LOCATIONS:
+                tasks.append((sheet, kw, loc_label, loc_string))
+    return tasks
+
+def _worker_task(
+    sheet: str,
+    kw: str,
+    loc_label: str,
+    loc_string: str,
+    api_key: str,
+    brand_patterns: List[Tuple[str, re.Pattern]],
+) -> List[Dict[str, Any]]:
+    """
+    Executes one keyword × location call, returns rows (already filtered by brand).
+    """
+    rows: List[Dict[str, Any]] = []
+    try:
+        payload = serp_shopping_search(
+            query=kw,
+            location=loc_string,
+            api_key=api_key,
+            num=MAX_RESULTS,
+            gl=GL,
+            hl=HL,
+            google_domain=GOOGLE_DOMAIN,
+            retries=MAX_API_RETRIES,
+            backoff_base=RETRY_BACKOFF_BASE,
+        )
+    except SerpApiError as e:
+        logger.error(f"[{sheet}] '{kw}' @ {loc_label}: {e}")
+        return rows
+
+    items = extract_shopping_results(payload)
+    if not items:
+        return rows
+
+    for it in items:
+        domain, syn = match_brand(it, brand_patterns)
+        if not domain:
+            continue
+        rows.append({
+            "Timestamp": _now(),
+            "Sheet": sheet,
+            "Keyword": kw,
+            "Location": loc_label,
+            "Position": it.get("Position"),
+            "Title": it.get("Title"),
+            "Price": it.get("Price"),
+            "Price Value": it.get("Price Value"),
+            "Old Price": it.get("Old Price"),
+            "Old Price Value": it.get("Old Price Value"),
+            "Rating": it.get("Rating"),
+            "Reviews": it.get("Reviews"),
+            "Merchant Name": it.get("Merchant Name"),
+            "Product Link": it.get("Product Link"),
+            "Brand": domain,
+            "Matched Synonym": syn,
+        })
+    return rows
+
+# ------------- Main -------------
+
+def run() -> None:
+    if not SERPAPI_KEY:
+        logger.error("Missing SERPAPI_KEY. Set it in your environment or .env file.")
+        return
+
+    if not pathlib.Path(KEYWORDS_FILE).is_file():
+        logger.error(f"Keywords file not found: {KEYWORDS_FILE}")
+        return
+
+    brands_map = load_brands_map(BRANDS_JSON_PATH)
+    brand_patterns = compile_brand_matchers(brands_map)
+
+    sheets_kws = _read_keywords_multi_sheet(KEYWORDS_FILE, SHEETS if SHEETS else None)
+
+    logger.info(f"📍 Multi-location mode: {len(LOCATIONS)} locations")
+    for label, code in LOCATIONS:
+        logger.info(f"   - {label} (code: {hashlib_stub(code)})")
+
+    total_keywords = sum(len(v) for v in sheets_kws.values())
+    logger.info(f"Loaded {total_keywords} keywords across {len(sheets_kws)} sheet(s)")
+
+    tasks = _build_tasks(sheets_kws)
+    logger.info(f"Scheduling {len(tasks)} keyword×location calls with MAX_WORKERS={MAX_WORKERS}, SERPAPI_QPS={SERPAPI_QPS}")
+
+    # Collect rows per sheet
+    per_sheet_rows: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+
+    with ThreadPoolExecutor(max_workers=max(1, MAX_WORKERS)) as ex:
+        futures = {
+            ex.submit(_worker_task, sheet, kw, loc_label, loc_string, SERPAPI_KEY, brand_patterns): (sheet, kw, loc_label)
+            for (sheet, kw, loc_label, loc_string) in tasks
+        }
+        for fut in as_completed(futures):
+            sheet, kw, loc_label = futures[fut]
+            try:
+                rows = fut.result()
+                if rows:
+                    per_sheet_rows[sheet].extend(rows)
+            except Exception as e:
+                logger.error(f"Worker failed for [{sheet}] '{kw}' @ {loc_label}: {e}")
+
+    # Build frames per sheet in input order
+    out_frames: "OrderedDict[str, pd.DataFrame]" = OrderedDict()
+    for sheet in sheets_kws.keys():
+        rows = per_sheet_rows.get(sheet, [])
+        df_sheet = pd.DataFrame(rows, columns=COLS) if rows else pd.DataFrame(columns=COLS)
+        out_frames[sheet] = df_sheet
+
+    # ---- APPEND to BOTH outputs every time ----
+    try:
+        append_xlsx_per_sheet(OUTPUT_XLSX, out_frames)
+        logger.info(f"XLSX appended: {OUTPUT_XLSX}")
+    except PermissionError as e:
+        logger.error(f"Failed to append XLSX (likely open/locked): {e}")
+
+    append_csv_folder(CSV_FALLBACK_DIR, out_frames)
+    logger.info(f"Per-sheet CSVs appended in: {CSV_FALLBACK_DIR}")
+
+    if all(df.empty for df in out_frames.values()):
+        logger.info("No rows collected.")
 
 if __name__ == "__main__":
     run()

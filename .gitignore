@@ -16,3 +16,7 @@ Thumbs.db
 google_shopping_brand_hits.csv
 .xlsx
 *.xlsx
+logs/gshop_2025-11-14.log
+run_gshop.cmd
+*.log
+brands_final - Copy.json
