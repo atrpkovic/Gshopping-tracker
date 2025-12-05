@@ -26,7 +26,7 @@ DATA_PATH_ENV = os.getenv("GSHOP_OUTPUT")
 
 CANDIDATES = [
     r"C:\Users\MDC21\vsfiles\.vscode\Gshopping-tracker\google_shopping_brand_hits.xlsx",  # Local dev
-    os.path.join(BASE_DIR, "google_shopping_brand_hits.parquet"),  # Parquet for Render
+    os.path.join(BASE_DIR, "google_shopping_brand_hits_cache.parquet"),  # Parquet for Render
     os.path.join(BASE_DIR, "google_shopping_brand_hits.xlsx"),
     DATA_PATH_ENV,
     os.path.join(BASE_DIR, "data", "google_shopping_brand_hits.xlsx"),
