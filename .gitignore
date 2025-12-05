@@ -1,0 +1,26 @@
+# Python cache and venv
+__pycache__/
+*.pyc
+venv/
+.env
+*.env
+.csv
+*.csv
+# Streamlit and config files
+.streamlit/
+.secrets.toml
+
+# OS files
+.DS_Store
+Thumbs.db
+google_shopping_brand_hits.csv
+logs/gshop_2025-11-14.log
+run_gshop.cmd
+*.log
+brands_final - Copy.json
+izmene za dash.txt
+cron_log.txt
+run_gshop.bat
+keywords.xlsx
+keywords_test.xlsx
+*.xlsx
