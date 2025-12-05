@@ -531,13 +531,13 @@ app.layout = dbc.Container([
                 ])), md=6),
             ], className="gy-3 mb-3"),
             
-            # Row 2: Heatmap and Scatter
+            # Row 2: Discount Over Time and Scatter
             dbc.Row([
                 dbc.Col(dbc.Card(dbc.CardBody([
-                    html.H5("Avg Discount by Location x Seller", id="tt-heat", style=HOVER_STYLE),
+                    html.H5("Avg Discount over Time", id="tt-heat", style=HOVER_STYLE),
                     dbc.Tooltip(
-                        "Heatmap showing average discount percentage, broken down by geographic location and seller. "
-                        "Darker blue indicates deeper discounts. Useful for spotting regional pricing strategies.",
+                        "Trend line showing the average discount percentage for each seller over time. "
+                        "Useful for spotting promotional periods and pricing strategy shifts.",
                         target="tt-heat"
                     ),
                     dcc.Graph(id="fig_heatmap", style={"height": "350px"})
@@ -718,7 +718,7 @@ from dash.exceptions import PreventUpdate
     Output("kpi-avgdisc", "children"),
     Input("run-button", "n_clicks"),
     Input("interval", "n_intervals"),
-    State("consolidate-toggle", "value"),
+    Input("consolidate-toggle", "value"),  # Changed to Input so toggle triggers refresh
     State("kw", "value"),
     State("loc", "value"),
     State("dates", "start_date"),
@@ -820,14 +820,18 @@ def update_charts(store_data, bar_sellers, pie_sellers, scatter_sellers, ts_sell
     else:
         share_fig = empty_fig("No Top 3 Data")
 
-    # 3. Heatmap (uses bar_sellers for filtering)
+    # 3. Avg Discount over Time (uses bar_sellers for filtering)
     heat_fig = empty_fig("No Data")
-    if "Discount %" in dff.columns and "Location" in dff.columns:
-        heat_data = dff[dff[seller_col].isin(bar_sellers)] if bar_sellers else dff
-        piv = heat_data.pivot_table(index="Location", columns=seller_col, values="Discount %", aggfunc="mean")
-        if not piv.empty:
-            heat_fig = go.Figure(data=go.Heatmap(z=piv.values, x=piv.columns, y=piv.index, colorscale="Blues"))
-            heat_fig.update_layout(margin=dict(t=20, b=80, l=80, r=20), xaxis_tickangle=-45)
+    if "Discount %" in dff.columns and "Timestamp" in dff.columns:
+        disc_data = dff[dff[seller_col].isin(bar_sellers)] if bar_sellers else dff
+        # Filter to rows that have a discount
+        disc_data = disc_data[disc_data["Discount %"].notna()]
+        if not disc_data.empty:
+            grp = disc_data.groupby([pd.Grouper(key="Timestamp", freq="D"), seller_col], observed=True)["Discount %"].mean().reset_index()
+            if not grp.empty:
+                heat_fig = px.line(grp, x="Timestamp", y="Discount %", color=seller_col)
+                heat_fig.update_layout(margin=dict(t=20, b=60, l=40, r=20),
+                                      legend=dict(orientation="h", y=-0.25, yanchor="top"))
 
     # 4. Scatter (Price vs Position) - with WebGL for performance
     if scatter_sellers:
